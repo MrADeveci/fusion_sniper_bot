@@ -1218,7 +1218,7 @@ class C79SniperBot:
         self.logger.info("Shutting down bot...")
         self.running = False
         
-        self.stats_tracker.write_stats()
+        self.stats_tracker.save_stats()
         self.remove_status_file()
         
         mt5.shutdown()
