@@ -1,1 +1,0 @@
-# c79_sniper_bot
