@@ -6,7 +6,7 @@ Independent BUY/SELL condition evaluation
 import pandas as pd
 from ta.trend import EMAIndicator, ADXIndicator
 from ta.momentum import RSIIndicator, StochasticOscillator
-
+from ta.volatility import BollingerBands
 
 class C79Strategy:
     """Trading strategy with independent BUY/SELL evaluation"""
