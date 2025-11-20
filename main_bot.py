@@ -207,30 +207,38 @@ class C79SniperBot:
             raise ValueError("TRADING must have use_atr_based_stops or legacy stop fields")
     
     def setup_logging(self):
-        """Setup logging system"""
+        """Setup logging system with daily symbol based files"""
         log_dir = Path('logs')
         log_dir.mkdir(exist_ok=True)
-        
+
         symbol = self.config['BROKER']['symbol']
-        today = datetime.now().strftime('%Y%m%d')
-        log_file = log_dir / f"{symbol}_{today}.log"
-        
+
+        # Use DDMMYYYY in the filename as requested
+        today_date = datetime.now().date()
+        date_str = today_date.strftime('%d%m%Y')
+        log_file = log_dir / f"{symbol}_{date_str}.log"
+
         self.logger = logging.getLogger(f"C79Sniper_{symbol}")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers = []
-        
-        file_handler = logging.FileHandler(log_file)
+
+        file_handler = logging.FileHandler(log_file, encoding="utf-8")
         file_handler.setLevel(logging.INFO)
-        
+
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.INFO)
-        
+
         formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
         file_handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
-        
+
         self.logger.addHandler(file_handler)
         self.logger.addHandler(console_handler)
+
+        # Track current log date and the active file handler so we can rotate at midnight
+        self.current_log_date = today_date
+        self.log_file_handler = file_handler
+
     
     def write_status_file(self):
         """Write bot status file with PID for remote control"""
@@ -259,29 +267,103 @@ class C79SniperBot:
             self.logger.error(f"Error removing status file: {e}")
     
     def cleanup_old_logs(self):
-        """Delete log files older than 7 days"""
+        """Delete symbol log files older than 7 days (e.g. XAUUSD_DDMMYYYY.log)"""
         try:
             log_dir = Path('logs')
             if not log_dir.exists():
                 return
-            
+
+            # Get symbol safely (works even when called early in __init__)
+            symbol = getattr(self, "symbol", None)
+            if not symbol:
+                symbol = self.config.get("BROKER", {}).get("symbol", "")
+
+            # Only touch files like XAUUSD_*.log (or whatever the symbol is)
+            pattern = f"{symbol}_*.log" if symbol else "*.log"
+            log_files = glob.glob(str(log_dir / pattern))
+
             cutoff_date = datetime.now() - timedelta(days=7)
-            log_files = glob.glob(str(log_dir / "*.log"))
-            
             deleted_count = 0
+
             for log_file in log_files:
                 file_path = Path(log_file)
+                if not file_path.is_file():
+                    continue
+
                 file_mtime = datetime.fromtimestamp(file_path.stat().st_mtime)
-                
                 if file_mtime < cutoff_date:
                     file_path.unlink()
                     deleted_count += 1
-            
+
             if deleted_count > 0:
-                print(f"Cleaned up {deleted_count} old log files (>7 days)")
+                # Log to the bot logger so it appears in the normal logs
+                self.logger.info(
+                    f"Cleaned up {deleted_count} old log file(s) (>7 days) matching {pattern}"
+                )
         except Exception as e:
-            print(f"Error cleaning old logs: {e}")
-    
+            # Use logger if available, otherwise fall back to print
+            try:
+                self.logger.error(f"Error cleaning old logs: {e}")
+            except Exception:
+                print(f"Error cleaning old logs: {e}")
+
+    def rotate_log_file_if_needed(self):
+        """
+        Rotate the symbol log file when the calendar day changes.
+        This keeps filenames in the form SYMBOL_DDMMYYYY.log and
+        calls cleanup_old_logs to enforce seven day retention.
+        """
+        try:
+            today = datetime.now().date()
+            current_date = getattr(self, "current_log_date", None)
+
+            # Nothing to do if still the same day
+            if current_date == today:
+                return
+
+            log_dir = Path('logs')
+            log_dir.mkdir(exist_ok=True)
+
+            # Close and detach the previous file handler if present
+            old_handler = getattr(self, "log_file_handler", None)
+            formatter = getattr(old_handler, "formatter", None)
+
+            if old_handler is not None:
+                try:
+                    self.logger.removeHandler(old_handler)
+                    old_handler.close()
+                except Exception:
+                    pass
+
+            # Build new filename with DDMMYYYY
+            date_str = today.strftime('%d%m%Y')
+            new_log_file = log_dir / f"{self.symbol}_{date_str}.log"
+
+            new_handler = logging.FileHandler(new_log_file, encoding="utf-8")
+            new_handler.setLevel(logging.INFO)
+
+            if formatter is None:
+                formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+            new_handler.setFormatter(formatter)
+
+            # Attach new handler and update tracking fields
+            self.logger.addHandler(new_handler)
+            self.log_file_handler = new_handler
+            self.current_log_date = today
+
+            self.logger.info("=" * 60)
+            self.logger.info(f"New trading day detected. switched to log file {new_log_file.name}")
+            self.logger.info("=" * 60)
+
+            # Enforce seven day retention after rolling
+            self.cleanup_old_logs()
+
+        except Exception as e:
+            # Fall back to console output if anything goes wrong here
+            print(f"Error rotating log file: {e}")
+
+
     def initialize_mt5(self):
         """Initialize MT5 connection"""
         if not mt5.initialize():
@@ -1083,6 +1165,9 @@ class C79SniperBot:
         
         try:
             while self.running:
+                # Rotate to a new daily log file after local midnight if needed
+                self.rotate_log_file_if_needed()
+
                 is_open, status_msg = self.is_within_trading_hours()
                 
                 if not is_open:
