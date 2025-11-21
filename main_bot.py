@@ -621,13 +621,7 @@ class C79SniperBot:
             
             # NET profit = Gross profit - Commission + Swap
             net_profit = total_profit - total_commission + total_swap
-            
-            self.logger.info(f"  Exit deals found: {trade_count}")
-            self.logger.info(f"  Gross profit: £{total_profit:.2f}")
-            self.logger.info(f"  Commission: £{total_commission:.2f}")
-            self.logger.info(f"  Swap: £{total_swap:.2f} ({swap_count} trades)")
-            self.logger.info(f"  NET profit: £{net_profit:.2f}")
-            
+                       
             # --- BEGIN: DAILY LOSS LIMIT ENFORCEMENT ---
             # Read configured daily loss (assume positive number in config)
             max_daily_loss_cfg = self.config.get('RISK', {}).get('max_daily_loss', 0)
