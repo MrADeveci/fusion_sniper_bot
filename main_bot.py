@@ -589,13 +589,7 @@ class C79SniperBot:
             broker_today_start = local_midnight + timedelta(hours=broker_timezone_offset)
             broker_today_end = broker_today_start + timedelta(days=1) - timedelta(seconds=1)
             broker_now = min(datetime.now() + timedelta(hours=broker_timezone_offset), broker_today_end)
-            
-            self.logger.info(f"Daily profit calculation:")
-            self.logger.info(f"  Local time now: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            self.logger.info(f"  Local midnight: {local_midnight.strftime('%Y-%m-%d %H:%M:%S')}")
-            self.logger.info(f"  Broker today start (adjusted): {broker_today_start.strftime('%Y-%m-%d %H:%M:%S')}")
-            self.logger.info(f"  Broker time now (adjusted): {broker_now.strftime('%Y-%m-%d %H:%M:%S')}")
-            
+                        
             # Query MT5 with broker-adjusted times
             deals = mt5.history_deals_get(broker_today_start, broker_now)
             
