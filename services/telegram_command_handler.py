@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Command Handler - C79 Sniper Bot (v4.0)
+Telegram Command Handler - Fusion Sniper Bot (v4.0)
 """
 
 import os
@@ -62,7 +62,7 @@ def clean_emoji_for_console(text):
 # Note: Logging will be reconfigured in __init__ with config values
 
 class TelegramCommandHandler:
-    """Handles incoming Telegram commands for C79 Sniper bot"""
+    """Handles incoming Telegram commands for Fusion Sniper bot"""
     
     def __init__(self, config_file='config.json'):
         """Initialize handler with bot config"""
@@ -225,7 +225,7 @@ class TelegramCommandHandler:
             
             wt_command = [
                 'wt', '-w', '0', 'nt',
-                '--title', f'C79 Sniper Bot - {self.symbol}',
+                '--title', f'Fusion Sniper Bot - {self.symbol}',
                 '--tabColor', '#00FF00',
                 '-d', self.bot_dir,
                 'cmd', '/c',
@@ -963,7 +963,7 @@ Daily Target: £{self.config['TRADING']['daily_profit_target']:.2f}
             sessions = stats.get('trades_by_session', {})
             exit_reasons = stats.get('exit_reasons', {})
             
-            message = f"""📊 <b>XAUUSD Trading Statistics</b>
+            message = f"""📊 <b>{self.symbol} Trading Statistics</b>
 
 📈 Total Trades: {total_trades}
 🎯 Win Rate: {win_rate:.1f}%
@@ -1092,7 +1092,7 @@ Trail: {exit_reasons.get('trailing', 0)} | BE: {exit_reasons.get('breakeven', 0)
 <b>Help:</b>
 /help - Show this message
 
-💰 XAUUSD Sniper Specialist
+💰 {self.symbol} Sniper Specialist
 🎯 Config-Driven | All settings adjustable"""
 
         return self.send_message(message)

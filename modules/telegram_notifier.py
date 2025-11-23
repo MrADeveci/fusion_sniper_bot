@@ -1,5 +1,5 @@
 """
-C79 Sniper - Telegram Notification Module v4.0
+Fusion Sniper - Telegram Notification Module v4.0
 Handles all Telegram message sending for trading bot notifications
 """
 
@@ -8,7 +8,7 @@ from datetime import datetime
 import logging
 
 class TelegramNotifier:
-    """Handles Telegram notifications for C79 Sniper Bot"""
+    """Handles Telegram notifications for Fusion Sniper Bot"""
     
     def __init__(self, bot_token, chat_id, enabled=True):
         """
@@ -498,7 +498,7 @@ Status: Active and monitoring
         message = """
 ⚠️ *Friday Trading Window Closing*
 
-Gold market closes at 22:00 (10 PM) on Friday.
+Market closes at 22:00 (10 PM) on Friday.
 
 No new trades will be opened after this time.
 Existing positions will be managed until close.
@@ -609,6 +609,6 @@ Markets open Monday 1am"""
 
 if __name__ == "__main__":
     # Test module
-    print("C79 Sniper - Telegram Notifier Module v4.0")
+    print("Fusion Sniper - Telegram Notifier Module v4.0")
     print("This module handles all Telegram notifications")
     print("Import this into your main bot to use notifications")
