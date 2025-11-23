@@ -21,7 +21,7 @@ from modules.telegram_notifier import TelegramNotifier
 from modules.trade_statistics import TradeStatistics
 
 
-class C79SniperBot:
+class FusionSniperBot:
     """Main trading bot class with ATR-based position management"""
     
     def __init__(self, config_file):
