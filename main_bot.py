@@ -1262,7 +1262,7 @@ class FusionSniperBot:
                                     self.logger.info(f"Trade signal: {signal['type']}")
                                     self.open_trade(signal)
                 
-                time.sleep(10)
+                time.sleep(self.config.get('SYSTEM', {}).get('main_loop_interval', 10))
         
         except KeyboardInterrupt:
             self.logger.info("Bot stopped by user")
