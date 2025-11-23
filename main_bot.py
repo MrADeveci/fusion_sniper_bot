@@ -121,15 +121,21 @@ class FusionSniperBot:
         self.current_mode = 'normal'
         self.last_atr_check = None
         
-        # Get pip size
+        # Get pip size (used for stats and SL/TP hit detection, not order sizing)
         symbol_info = mt5.symbol_info(self.symbol)
         if symbol_info:
             if self.symbol == "XAUUSD":
+                # XAU is typically quoted to 2 or 3 decimals; treat 0.1 as a "pip"
                 self.pip_size = 0.1
+            elif "BTC" in self.symbol:
+                # For BTC CFDs treat 1.0 as a pip (adjust later if you prefer)
+                self.pip_size = 1.0
             else:
+                # Generic case based on broker point value
                 self.pip_size = symbol_info.point * 10
         else:
-            self.pip_size = 0.0001 if 'JPY' not in self.symbol else 0.01
+            # Fallback . safe default if symbol_info is not available
+            self.pip_size = 0.0001
         
         # Logging
         self.logger.info("="*60)
@@ -366,28 +372,41 @@ class FusionSniperBot:
 
     def initialize_mt5(self):
         """Initialize MT5 connection"""
-        if not mt5.initialize():
-            print("MT5 initialization failed")
-            return False
-        
         broker = self.config['BROKER']
+        mt5_path = broker.get('mt5_path')
+
+        try:
+            if mt5_path:
+                # Use specific terminal path if provided in config
+                if not mt5.initialize(path=mt5_path):
+                    print(f"MT5 initialization failed for path: {mt5_path}")
+                    return False
+            else:
+                # Fallback to default behaviour if no path is configured
+                if not mt5.initialize():
+                    print("MT5 initialization failed")
+                    return False
+        except Exception as e:
+            print(f"MT5 initialization exception: {e}")
+            return False
+
         account = broker.get('account')
         password = broker.get('password')
         server = broker.get('server')
-        
+
         if account and password and server:
             authorized = mt5.login(account, password=password, server=server)
             if not authorized:
                 print(f"Login failed: {mt5.last_error()}")
                 mt5.shutdown()
                 return False
-        
+
         symbol = broker['symbol']
         if not mt5.symbol_select(symbol, True):
             print(f"Failed to select {symbol}")
             mt5.shutdown()
             return False
-        
+
         return True
     
     def calculate_atr(self):
