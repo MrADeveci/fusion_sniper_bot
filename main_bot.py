@@ -970,11 +970,13 @@ class FusionSniperBot:
             }
             
             result = mt5.order_send(request)
-            
+
             if result is None:
-                self.logger.error("Order send failed: No result")
+                # Log the underlying MT5 error for diagnosis
+                last_error = mt5.last_error()
+                self.logger.error(f"Order send failed: No result. MT5 last_error: {last_error}")
                 return False
-            
+
             if result.retcode != mt5.TRADE_RETCODE_DONE:
                 self.logger.error(f"Trade rejected: {result.retcode} - {result.comment}")
                 return False
