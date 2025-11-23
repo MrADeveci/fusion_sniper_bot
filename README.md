@@ -282,10 +282,10 @@ You would create one config per account or per symbol.
   "BROKER": {
     "symbol": "XAUUSD",
     "magic_number": 234000,
-    "account": 52576068,
+    "account": 111111111,
     "password": "YOUR_MT5_PASSWORD",
     "server": "YourBroker-Server",
-    "mt5_path": "C:\fusion_sniper_bot_xau_52576068\MT5\terminal64.exe",
+    "mt5_path": "C:\fusion_sniper_bot_xau_111111111\MT5\terminal64.exe",
     "broker_timezone_offset": 2
   },
 
