@@ -106,13 +106,18 @@ class FusionSniperBot:
         self.daily_target_reached = False
         self.last_target_check_date = datetime.now().date()
         self.starting_equity_today = None  # NEW: Track starting equity for loss limit
+
+        # Loop timing from config
+        system_cfg = self.config.get('SYSTEM', {})
+        self.main_loop_interval = system_cfg.get('main_loop_interval', 10)
+        self.paused_loop_interval = system_cfg.get('paused_loop_interval', 30)
         
         # VOLATILITY DETECTION
         self.volatility_config = self.config['TRADING'].get('volatility_detection', {})
         self.volatility_enabled = self.volatility_config.get('enabled', False)
         self.atr_period = self.volatility_config.get('atr_period', 14)
         self.atr_scalp_threshold = self.volatility_config.get('atr_scalp_threshold', 2.0)
-        self.scalp_profit_target = self.volatility_config.get('scalp_profit_target_gbp', 2.28)
+        self.scalp_profit_target = self.volatility_config.get('scalp_profit_target_gbp', 26.82)
         self.scalp_cooldown = self.volatility_config.get('scalp_cooldown_seconds', 30)
         self.normal_cooldown = self.volatility_config.get('normal_cooldown_seconds', 60)
         
@@ -1262,7 +1267,9 @@ class FusionSniperBot:
                                     self.logger.info(f"Trade signal: {signal['type']}")
                                     self.open_trade(signal)
                 
-                time.sleep(self.config.get('SYSTEM', {}).get('main_loop_interval', 10))
+                # Faster loop while trading. slower loop when paused for the day
+                sleep_interval = self.paused_loop_interval if target_reached else self.main_loop_interval
+                time.sleep(sleep_interval)
         
         except KeyboardInterrupt:
             self.logger.info("Bot stopped by user")
