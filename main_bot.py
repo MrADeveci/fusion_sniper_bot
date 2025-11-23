@@ -1,5 +1,5 @@
 """
-C79 Sniper Bot - v4.0 TIDIED UP VERSION
+Fusion Sniper Bot - v4.0 TIDIED UP VERSION
 """
 
 import MetaTrader5 as mt5
@@ -14,7 +14,7 @@ import os
 import glob
 
 # Import local modules
-from modules.strategy import C79Strategy
+from modules.strategy import FusionStrategy
 from modules.risk_manager import RiskManager
 from modules.news_filter import EconomicNewsFilter
 from modules.telegram_notifier import TelegramNotifier
@@ -43,7 +43,7 @@ class C79SniperBot:
             raise Exception("Failed to initialize MT5")
         
         # Initialize modules
-        self.strategy = C79Strategy(self.config)
+        self.strategy = FusionStrategy(self.config)
         self.risk_manager = RiskManager(self.config)
         self.news_filter = EconomicNewsFilter(self.config)
         self.stats_tracker = TradeStatistics(self.config)
@@ -133,7 +133,7 @@ class C79SniperBot:
         
         # Logging
         self.logger.info("="*60)
-        self.logger.info(f"C79 Sniper Bot v3.0 (News Fetch Fix)")
+        self.logger.info(f"Fusion Sniper Bot v3.0 (News Fetch Fix)")
         self.logger.info(f"Symbol: {self.symbol}")
         self.logger.info("="*60)
         self.logger.info(f"Magic number: {self.magic_number}")
@@ -218,7 +218,7 @@ class C79SniperBot:
         date_str = today_date.strftime('%d%m%Y')
         log_file = log_dir / f"{symbol}_{date_str}.log"
 
-        self.logger = logging.getLogger(f"C79Sniper_{symbol}")
+        self.logger = logging.getLogger(f"FusionSniper_{symbol}")
         self.logger.setLevel(logging.INFO)
         self.logger.handlers = []
 
@@ -945,7 +945,7 @@ class C79SniperBot:
                 "tp": tp,
                 "deviation": 10,
                 "magic": self.magic_number,
-                "comment": "c79_sniper_bot_v3",
+                "comment": "fusion_sniper_bot_v4",
                 "type_time": mt5.ORDER_TIME_GTC,
                 "type_filling": mt5.ORDER_FILLING_IOC,
             }
@@ -1311,6 +1311,6 @@ if __name__ == "__main__":
         print(f"Config file not found: {config_file}")
         sys.exit(1)
     
-    bot = C79SniperBot(config_file)
+    bot = FusionSniperBot(config_file)
     bot.run()
     
