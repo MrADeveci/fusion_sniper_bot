@@ -1,5 +1,5 @@
 """
-C79 Sniper Bot Strategy v4.0
+Fusion Sniper Bot Strategy v4.0
 Independent BUY/SELL condition evaluation
 """
 
@@ -9,7 +9,7 @@ from ta.momentum import RSIIndicator, StochasticOscillator
 from ta.volatility import BollingerBands
 
 
-class C79Strategy:
+class FusionStrategy:
     """Trading strategy with independent BUY/SELL evaluation"""
 
     def __init__(self, config):
