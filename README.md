@@ -407,14 +407,14 @@ All pointed at the same folder.
 A common layout for running multiple accounts or symbols is:
 
 ```text
-C:usion_sniper_bot\                    # main codebase linked to GitHub
+C:\fusion_sniper_bot\                    # main codebase linked to GitHub
 
-C:usion_sniper_bot_xau_52576068\       # XAUUSD instance for account 52576068
+C:\fusion_sniper_bot_xau_1111111\       # XAUUSD instance for account 52576068
   MT5\                                   # portable MT5 for that account
   main_bot.py
   config.json                            # XAU config
   modules  services  logs
-C:usion_sniper_bot_btc_52617101\       # BTCUSD instance for account 52617101
+C:\fusion_sniper_bot_btc_1111111\       # BTCUSD instance for account 52617101
   MT5\                                   # portable MT5 for that account
   main_bot.py
   config.json                            # BTC config
@@ -422,7 +422,7 @@ C:usion_sniper_bot_btc_52617101\       # BTCUSD instance for account 52617101
 
 Workflow.
 
-- Develop and version control the code in `C:usion_sniper_bot`
+- Develop and version control the code in `C:\fusion_sniper_bot`
 - When you are happy with a version. copy updated Python files into each runtime folder without overwriting:
   - `config.json`
   - `MT5\`
