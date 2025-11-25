@@ -582,9 +582,9 @@ class FusionSniperBot:
 
     def is_in_swap_avoidance_window(self):
         """
-        Check if we are inside a configured swap / rollover avoidance window.
+        Check if we are inside a configured swap or rollover avoidance window.
         Times are interpreted in broker server time using BROKER.broker_timezone_offset.
-        Returns (bool, str) where str is a human-readable status message.
+        Returns (bool, str) where str is a human readable status message.
         """
         if not getattr(self, "swap_avoidance_enabled", False):
             return False, ""
@@ -610,10 +610,11 @@ class FusionSniperBot:
                 except ValueError:
                     continue  # skip malformed entries
 
-                start_time = time(start_hour, start_minute)
-                end_time = time(end_hour, end_minute)
+                # Build time objects from the datetime module, not the time module
+                start_time = dt.time(start_hour, start_minute)
+                end_time = dt.time(end_hour, end_minute)
 
-                # Handle windows that cross midnight (e.g. 23:55 -> 00:10)
+                # Handle windows that cross midnight, e.g. 23:30 -> 00:20
                 if start_time <= end_time:
                     in_window = start_time <= current_time <= end_time
                 else:
@@ -621,7 +622,7 @@ class FusionSniperBot:
 
                 if in_window:
                     msg = (
-                        f"Swap avoidance window {start_str}–{end_str} (server time). "
+                        f"Swap avoidance window {start_str}-{end_str} (server time). "
                         f"Server now {server_now.strftime('%Y-%m-%d %H:%M')}"
                     )
                     return True, msg
