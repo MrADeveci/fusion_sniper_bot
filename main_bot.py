@@ -1,17 +1,20 @@
 """
-Fusion Sniper Bot - v4.0 TIDIED UP VERSION
+Fusion Sniper Bot - v4.0
 """
+
+import datetime as dt
+import glob
+import json
+import logging
+import os
+import sys
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
 
 import MetaTrader5 as mt5
 import numpy as np
-import time
-import logging
-import json
-from datetime import datetime, timedelta, time
-from pathlib import Path
-import sys
-import os
-import glob
+
 
 # Import local modules
 from modules.strategy import FusionStrategy
