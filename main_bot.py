@@ -129,6 +129,10 @@ class FusionSniperBot:
         self.current_mode = 'normal'
         self.last_atr_check = None
 
+        # Extreme volatility handling
+        self.skip_on_extreme_atr = self.volatility_config.get('skip_trading_when_atr_extreme', False)
+        self.atr_max_for_trading = self.volatility_config.get('atr_max_for_trading', None)
+
         # Swap / rollover avoidance (server time windows)
         swap_cfg = self.config['TRADING'].get('swap_avoidance', {})
         self.swap_avoidance_enabled = swap_cfg.get('enabled', False)
@@ -1265,11 +1269,11 @@ class FusionSniperBot:
                 # Check if weekly news summary should be sent
                 self.check_and_send_weekly_news_summary()
                 
-                # CRITICAL FIX: Ensure news data is fresh REGARDLESS of pause status
-                # This keeps /news command data up-to-date even when bot is paused
+                # Ensure news data is fresh regardless of pause status
+                # This keeps /news command data up to date even when bot is paused
                 self.ensure_news_data_fresh()
                 
-                # Check news avoidance status - do this BEFORE checking daily target
+                # Check news avoidance status. do this BEFORE checking daily target
                 # This ensures we log news avoidance even when paused for daily profit
                 avoiding_news, news_event = self.news_filter.should_avoid_trading()
                 if avoiding_news:
@@ -1281,18 +1285,33 @@ class FusionSniperBot:
                         self.alerted_news_events.add(event_key)
                         self.logger.info(f"News avoidance alert sent: {news_event['title']}")
                     
-                    # Log that we're avoiding (visible even when paused for daily target)
+                    # Log that we are avoiding (visible even when paused for daily target)
                     self.logger.info(f"[NEWS FILTER] Avoiding trading: {news_event['title']}")
                 
                 target_reached = self.check_daily_profit()
 
-                # Check swap / rollover avoidance window (server time)
+                # Check swap or rollover avoidance window (server time)
                 in_swap_window, swap_msg = self.is_in_swap_avoidance_window()
                 if in_swap_window:
                     self.logger.info(f"[SWAP] Avoiding new trades: {swap_msg}")
                 
+                # Update ATR and mode
                 self.update_trading_mode()
-                
+
+                # Extreme ATR filter. skip new trades if volatility is insane
+                extreme_volatility = False
+                if (
+                    getattr(self, "skip_on_extreme_atr", False)
+                    and self.current_atr is not None
+                    and self.atr_max_for_trading is not None
+                ):
+                    if self.current_atr > self.atr_max_for_trading:
+                        extreme_volatility = True
+                        self.logger.info(
+                            f"[VOL] ATR {self.current_atr:.4f} above max {self.atr_max_for_trading:.4f}. "
+                            "Skipping new trades due to extreme volatility"
+                        )
+               
                 if self.volatility_enabled and self.current_atr:
                     mode_label = "[SCALP]" if self.current_mode == 'scalp' else "[NORMAL]"
                     self.logger.info(f"{mode_label} Mode: {self.current_mode.upper()} | ATR: {self.current_atr:.4f}")
@@ -1313,12 +1332,13 @@ class FusionSniperBot:
                 if position_count > 0:
                     self.manage_positions()
                 
-                # Look for new trades (only when not paused by daily target, news, or swap window)
+                # Look for new trades. only when not paused by daily target, news, swap window, or extreme ATR
                 if (
                     position_count < self.max_positions
                     and not target_reached
                     and not avoiding_news
                     and not in_swap_window
+                    and not extreme_volatility
                 ):
                     in_cooldown, remaining = self.is_in_cooldown()
                     if in_cooldown:
