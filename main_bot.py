@@ -7,7 +7,7 @@ import numpy as np
 import time
 import logging
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from pathlib import Path
 import sys
 import os
@@ -125,6 +125,12 @@ class FusionSniperBot:
         self.current_atr = None
         self.current_mode = 'normal'
         self.last_atr_check = None
+
+        # Swap / rollover avoidance (server time windows)
+        swap_cfg = self.config['TRADING'].get('swap_avoidance', {})
+        self.swap_avoidance_enabled = swap_cfg.get('enabled', False)
+        # List of {"start": "HH:MM", "end": "HH:MM"} in server time
+        self.swap_avoidance_windows = swap_cfg.get('server_time_windows', [])
         
         # Get pip size (used for stats and SL/TP hit detection, not order sizing)
         symbol_info = mt5.symbol_info(self.symbol)
@@ -570,6 +576,57 @@ class FusionSniperBot:
                 return False, f"Market CLOSED - {current_day} after {self.friday_close_hour:02d}:00 | Opens Sunday {self.sunday_open_hour:02d}:00 (in {hours_until_open:.1f} hours)"
         
         return True, f"Market OPEN - {current_day} {now.strftime('%H:%M')}"
+
+    def is_in_swap_avoidance_window(self):
+        """
+        Check if we are inside a configured swap / rollover avoidance window.
+        Times are interpreted in broker server time using BROKER.broker_timezone_offset.
+        Returns (bool, str) where str is a human-readable status message.
+        """
+        if not getattr(self, "swap_avoidance_enabled", False):
+            return False, ""
+
+        if not self.swap_avoidance_windows:
+            return False, ""
+
+        try:
+            broker_offset = self.config.get('BROKER', {}).get('broker_timezone_offset', 0)
+            # Approximate server time = local time + offset
+            server_now = datetime.now() + timedelta(hours=broker_offset)
+            current_time = server_now.time()
+
+            for window in self.swap_avoidance_windows:
+                start_str = window.get("start")
+                end_str = window.get("end")
+                if not start_str or not end_str:
+                    continue
+
+                try:
+                    start_hour, start_minute = map(int, start_str.split(":"))
+                    end_hour, end_minute = map(int, end_str.split(":"))
+                except ValueError:
+                    continue  # skip malformed entries
+
+                start_time = time(start_hour, start_minute)
+                end_time = time(end_hour, end_minute)
+
+                # Handle windows that cross midnight (e.g. 23:55 -> 00:10)
+                if start_time <= end_time:
+                    in_window = start_time <= current_time <= end_time
+                else:
+                    in_window = (current_time >= start_time) or (current_time <= end_time)
+
+                if in_window:
+                    msg = (
+                        f"Swap avoidance window {start_str}–{end_str} (server time). "
+                        f"Server now {server_now.strftime('%Y-%m-%d %H:%M')}"
+                    )
+                    return True, msg
+
+            return False, ""
+        except Exception as e:
+            self.logger.error(f"Error checking swap avoidance window: {e}")
+            return False, ""
     
     def get_market_data(self, bars=100):
         """Get market data"""
@@ -1224,6 +1281,11 @@ class FusionSniperBot:
                     self.logger.info(f"[NEWS FILTER] Avoiding trading: {news_event['title']}")
                 
                 target_reached = self.check_daily_profit()
+
+                # Check swap / rollover avoidance window (server time)
+                in_swap_window, swap_msg = self.is_in_swap_avoidance_window()
+                if in_swap_window:
+                    self.logger.info(f"[SWAP] Avoiding new trades: {swap_msg}")
                 
                 self.update_trading_mode()
                 
@@ -1247,8 +1309,13 @@ class FusionSniperBot:
                 if position_count > 0:
                     self.manage_positions()
                 
-                # Look for new trades (only when not paused by daily target OR news)
-                if position_count < self.max_positions and not target_reached and not avoiding_news:
+                # Look for new trades (only when not paused by daily target, news, or swap window)
+                if (
+                    position_count < self.max_positions
+                    and not target_reached
+                    and not avoiding_news
+                    and not in_swap_window
+                ):
                     in_cooldown, remaining = self.is_in_cooldown()
                     if in_cooldown:
                         self.logger.info(f"In cooldown: {remaining}s remaining")
