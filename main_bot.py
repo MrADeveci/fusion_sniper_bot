@@ -108,7 +108,11 @@ class FusionSniperBot:
         self.daily_profit_target = self.config['TRADING'].get('daily_profit_target', 0)
         self.daily_target_reached = False
         self.last_target_check_date = datetime.now().date()
-        self.starting_equity_today = None  # NEW: Track starting equity for loss limit
+        self.starting_equity_today = None  # Track starting equity for loss limit
+
+        # Daily loss.pending state so we can recheck after open trades close
+        self.loss_limit_pending = False
+        self.loss_limit_triggered_time = None
 
         # Loop timing from config
         system_cfg = self.config.get('SYSTEM', {})
@@ -649,31 +653,34 @@ class FusionSniperBot:
             return None
     
     def check_daily_profit(self):
-        """Check daily profit and update pause status - TIMEZONE AWARE + SWAP INCLUDED"""
-        if self.daily_profit_target <= 0:
-            return False
-        
+        """Check daily profit and update pause status. TIMEZONE AWARE + SWAP INCLUDED with pending loss behaviour"""
         try:
+            # Ensure loss-limit state attributes exist
+            if not hasattr(self, "loss_limit_pending"):
+                self.loss_limit_pending = False
+            if not hasattr(self, "loss_limit_triggered_time"):
+                self.loss_limit_triggered_time = None
+
             # Get timezone offset from config (default 0 if not specified)
             broker_timezone_offset = self.config.get('BROKER', {}).get('broker_timezone_offset', 0)
             
-            # Check if new day - reset pause flag (using LOCAL time for date check)
+            # Check if new day. reset pause flags (using LOCAL time for date check)
             current_date = datetime.now().date()
             if current_date != self.last_target_check_date:
                 self.daily_target_reached = False
-                self.starting_equity_today = None  # NEW: Reset starting equity tracker
+                self.loss_limit_pending = False
+                self.loss_limit_triggered_time = None
+                self.starting_equity_today = None  # reset starting equity tracker
                 self.last_target_check_date = current_date
-                self.logger.info(f"NEW DAY - Daily profit target reset (Local timezone)")
+                self.logger.info("NEW DAY. Daily profit/loss logic reset (Local timezone)")
                 if broker_timezone_offset != 0:
-                    self.logger.info(f"Timezone offset: Broker is GMT+{broker_timezone_offset}, queries adjusted accordingly")
+                    self.logger.info(f"Timezone offset. Broker is GMT+{broker_timezone_offset}, queries adjusted accordingly")
             
-            # If already reached today, stay paused
+            # If we already have a confirmed daily stop, stay paused
             if self.daily_target_reached:
                 return True
             
-            # Calculate today's profit - TIMEZONE ADJUSTED
-            # Local midnight + offset = broker midnight
-            # Example: UK 00:00 + 2hrs = Server 02:00 (start of UK trading day in server time)
+            # Calculate today's profit. TIMEZONE ADJUSTED
             local_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
             broker_today_start = local_midnight + timedelta(hours=broker_timezone_offset)
             broker_today_end = broker_today_start + timedelta(days=1) - timedelta(seconds=1)
@@ -683,38 +690,47 @@ class FusionSniperBot:
             deals = mt5.history_deals_get(broker_today_start, broker_now)
             
             if deals is None:
-                self.logger.debug(f"  No deals returned from MT5")
-                return False
+                self.logger.debug("  No deals returned from MT5")
+                return self.daily_target_reached or self.loss_limit_pending
             
             # Calculate NET profit (only count exit deals to avoid double-counting)
-            # FIXED: Now includes commission and swap from MT5 deal fields
             total_profit = 0.0
             total_commission = 0.0
             total_swap = 0.0
-            trade_count = 0
-            swap_count = 0
             
             # Count ALL deals for commission, but only EXIT deals for profit
             for deal in deals:
                 if deal.magic == self.magic_number:
-                    # Count commission from ALL deals (entry + exit)
+                    # Commission from all deals (entry + exit)
                     total_commission += abs(deal.commission)
                     
-                    # Only count exit deals for profit/swap/trade count
+                    # Only exit deals for profit/swap
                     if deal.entry == mt5.DEAL_ENTRY_OUT:
                         total_profit += deal.profit
                         total_swap += deal.swap
-                        trade_count += 1
-                        if deal.swap != 0:
-                            swap_count += 1
             
             # NET profit = Gross profit - Commission + Swap
             net_profit = total_profit - total_commission + total_swap
-                       
-            # --- BEGIN: DAILY LOSS LIMIT ENFORCEMENT ---
-            # Read configured daily loss (assume positive number in config)
+
+            # Check if there are open positions for this bot on this symbol
+            has_open_positions_for_bot = False
+            try:
+                positions = mt5.positions_get(symbol=self.symbol)
+                if positions:
+                    for pos in positions:
+                        if pos.magic == self.magic_number:
+                            has_open_positions_for_bot = True
+                            break
+            except Exception as e:
+                self.logger.debug(f"Position lookup failed during daily loss check. {e}")
+            
+            # --- DAILY LOSS LIMIT ENFORCEMENT ---
+            loss_breached = False
             max_daily_loss_cfg = self.config.get('RISK', {}).get('max_daily_loss', 0)
-            max_daily_loss_currency = self.config.get('RISK', {}).get('max_daily_loss_currency', 'GBP')  # optional override
+            max_daily_loss_currency = self.config.get('RISK', {}).get('max_daily_loss_currency', 'GBP')
+
+            cap = None
+            account_currency = None
 
             if max_daily_loss_cfg and max_daily_loss_cfg > 0:
                 # Determine account currency
@@ -724,62 +740,45 @@ class FusionSniperBot:
                 except Exception:
                     account_currency = self.config.get('BROKER', {}).get('account_currency')
 
-                # If config currency differs from account currency, try to convert using market rates
+                # Convert configured loss into account currency if needed
                 max_daily_loss_account_ccy = float(max_daily_loss_cfg)
                 if account_currency and account_currency.upper() != max_daily_loss_currency.upper():
-                    # attempt to find a FX symbol to convert from config currency -> account currency
                     src = max_daily_loss_currency.upper()
                     dst = account_currency.upper()
-
-                    # common symbol forms to try
                     possible_pairs = [f"{src}{dst}", f"{dst}{src}"]
                     rate = None
                     for pair in possible_pairs:
                         try:
                             tick = mt5.symbol_info_tick(pair)
                             if tick is not None:
-                                # if symbol is DST/SRC inverted, invert rate accordingly
+                                mid = (tick.ask + tick.bid) / 2.0
                                 if pair == f"{src}{dst}":
-                                    rate = (tick.ask + tick.bid) / 2.0
-                                    max_daily_loss_account_ccy = max_daily_loss_account_ccy * rate
+                                    max_daily_loss_account_ccy *= mid
                                 else:
-                                    rate = (tick.ask + tick.bid) / 2.0
-                                    # pair is DST+SRC, so convert by 1/rate
-                                    max_daily_loss_account_ccy = max_daily_loss_account_ccy / rate
+                                    max_daily_loss_account_ccy /= mid
+                                rate = mid
                                 break
                         except Exception:
                             continue
 
-                    # if conversion failed, log and treat config value as account currency for safety
                     if rate is None:
                         self.logger.warning(f"Failed to auto-convert {max_daily_loss_cfg} {src} to {dst}. Treating limit as {dst}.")
-                        # no conversion applied - proceed with raw number
+                        # fall through using raw number
 
-                # At this point max_daily_loss_account_ccy is the numeric cap expressed in account currency
                 try:
                     cap = float(max_daily_loss_account_ccy)
                 except Exception:
                     cap = float(max_daily_loss_cfg)
 
-                # CHECK 1 - Closed-deals net profit (existing behavior)
+                # CHECK 1. closed-deals net profit
                 if net_profit <= -cap:
-                    self.daily_target_reached = True
-                    self.logger.info("="*60)
-                    self.logger.info(f"DAILY LOSS LIMIT REACHED: -{max_daily_loss_cfg:.2f} {max_daily_loss_currency} (approx {cap:.2f} {account_currency})")
-                    self.logger.info("Bot will PAUSE new trades until midnight (Local). Existing positions will be managed.")
-                    self.logger.info("="*60)
-                    try:
-                        self.telegram.notify_daily_loss_limit(self.symbol, net_profit, max_daily_loss_cfg)
-                    except Exception:
-                        pass
-                    return True
+                    loss_breached = True
 
-                # CHECK 2 - Optional: equity drawdown based (real-time)
+                # CHECK 2. optional equity drawdown based
                 if self.config.get('RISK', {}).get('loss_limit_by_equity', True):
                     try:
                         account_info = mt5.account_info()
                         current_equity = float(account_info.equity)
-                        # track starting equity for the day in state file if not present
                         starting_equity = getattr(self, 'starting_equity_today', None)
                         if starting_equity is None:
                             self.starting_equity_today = float(account_info.balance)
@@ -787,34 +786,85 @@ class FusionSniperBot:
 
                         drawdown = starting_equity - current_equity
                         if drawdown >= cap:
-                            self.daily_target_reached = True
-                            self.logger.info("="*60)
-                            self.logger.info(f"DAILY LOSS BY EQUITY REACHED: drawdown {drawdown:.2f} {account_currency} >= {cap:.2f}")
-                            self.logger.info("Bot will PAUSE new trades until midnight (Local).")
-                            self.logger.info("="*60)
-                            try:
-                                self.telegram.notify_daily_loss_limit(self.symbol, -drawdown, max_daily_loss_cfg)
-                            except Exception:
-                                pass
-                            return True
+                            loss_breached = True
                     except Exception as e:
-                        self.logger.debug(f"Equity-based loss check failed: {e}")
-            # --- END: DAILY LOSS LIMIT ENFORCEMENT ---
-            
-            if net_profit >= self.daily_profit_target:
-                self.daily_target_reached = True  # Set pause flag
-                self.logger.info(f"="*60)
-                self.logger.info(f"DAILY PROFIT TARGET REACHED: £{net_profit:.2f}")
-                self.logger.info(f"Bot will PAUSE new trades until midnight (00:00 Local)")
-                self.logger.info(f"Existing positions will still be managed")
-                self.logger.info(f"="*60)
-                self.telegram.notify_daily_target_reached(self.symbol, net_profit, self.daily_profit_target)
+                        self.logger.debug(f"Equity-based loss check failed. {e}")
+
+            # Handle existing pending loss state first
+            if self.loss_limit_pending:
+                if has_open_positions_for_bot:
+                    # Still waiting for positions to close. block new trades
+                    return True
+                else:
+                    # All positions for this bot are closed. re-evaluate loss
+                    if loss_breached and cap is not None:
+                        self.daily_target_reached = True
+                        self.loss_limit_pending = False
+                        self.logger.info("=" * 60)
+                        self.logger.info("DAILY LOSS LIMIT CONFIRMED AFTER POSITIONS CLOSED")
+                        if account_currency:
+                            self.logger.info(f"Net profit today. {net_profit:.2f} {account_currency} vs cap -{cap:.2f} {account_currency}")
+                        self.logger.info("Bot will PAUSE new trades until midnight (Local).")
+                        self.logger.info("=" * 60)
+                        try:
+                            self.telegram.notify_daily_loss_limit(self.symbol, net_profit, max_daily_loss_cfg)
+                        except Exception:
+                            pass
+                        return True
+                    else:
+                        # Loss has recovered above threshold. clear and resume
+                        self.logger.info("Loss limit recovered after positions closed. resuming trading for today.")
+                        self.loss_limit_pending = False
+                        self.loss_limit_triggered_time = None
+                        # fall through to profit target logic
+
+            # No previous pending state. handle a fresh loss breach
+            if loss_breached and cap is not None and not self.daily_target_reached:
+                if has_open_positions_for_bot:
+                    # Soft lock. wait for these positions to close
+                    self.loss_limit_pending = True
+                    self.loss_limit_triggered_time = datetime.now()
+                    self.logger.info("=" * 60)
+                    self.logger.info("DAILY LOSS LIMIT BREACHED WITH OPEN POSITIONS")
+                    if account_currency:
+                        self.logger.info(f"Current net profit. {net_profit:.2f} {account_currency} vs cap -{cap:.2f} {account_currency}")
+                    self.logger.info("Pausing NEW trades until existing positions for this bot are closed. loss will then be re-evaluated.")
+                    self.logger.info("=" * 60)
+                    return True
+                else:
+                    # Hard daily stop straight away
+                    self.daily_target_reached = True
+                    self.logger.info("=" * 60)
+                    self.logger.info(f"DAILY LOSS LIMIT REACHED. -{max_daily_loss_cfg:.2f} {max_daily_loss_currency} (approx {cap:.2f} {account_currency})")
+                    self.logger.info("Bot will PAUSE new trades until midnight (Local). Existing positions will be managed.")
+                    self.logger.info("=" * 60)
+                    try:
+                        self.telegram.notify_daily_loss_limit(self.symbol, net_profit, max_daily_loss_cfg)
+                    except Exception:
+                        pass
+                    return True
+
+            # --- DAILY PROFIT TARGET ENFORCEMENT ---
+            # Only applies if you have set a positive target in config
+            if self.daily_profit_target > 0 and net_profit >= self.daily_profit_target:
+                self.daily_target_reached = True
+                self.logger.info("=" * 60)
+                self.logger.info(f"DAILY PROFIT TARGET REACHED. £{net_profit:.2f}")
+                self.logger.info("Bot will PAUSE new trades until midnight (00:00 Local)")
+                self.logger.info("Existing positions will still be managed")
+                self.logger.info("=" * 60)
+                try:
+                    self.telegram.notify_daily_target_reached(self.symbol, net_profit, self.daily_profit_target)
+                except Exception:
+                    pass
                 return True
             
-            return False
+            # If none of the conditions fired, only pause if a flag is set
+            return self.daily_target_reached or self.loss_limit_pending
+
         except Exception as e:
-            self.logger.error(f"Error checking daily profit: {e}")
-            return False
+            self.logger.error(f"Error checking daily profit. {e}")
+            return self.daily_target_reached or self.loss_limit_pending
 
     
     def is_in_cooldown(self):
