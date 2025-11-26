@@ -1,5 +1,5 @@
 """
-Fusion Sniper Bot - v4.0
+Fusion Sniper Bot - v4.1
 """
 
 import datetime as dt
@@ -93,7 +93,7 @@ class FusionSniperBot:
         
         # Cooldown tracking
         self.last_trade_time = None
-        self.last_trade_type = None
+               self.last_trade_type = None
         self.trade_cooldown = self.config['TRADING'].get('trade_cooldown_seconds', 60)
         
         # Trading hours from config
@@ -112,7 +112,6 @@ class FusionSniperBot:
 
         # Daily loss / profit pending state so we can recheck after open trades close
         self.loss_limit_pending = False
-        self.loss_limit_triggered_time = None
         self.profit_target_pending = False
 
         # Loop timing from config
@@ -157,24 +156,24 @@ class FusionSniperBot:
                 # Generic case based on broker point value
                 self.pip_size = symbol_info.point * 10
         else:
-            # Fallback . safe default if symbol_info is not available
+            # Fallback. safe default if symbol_info is not available
             self.pip_size = 0.0001
         
         # Logging
         self.logger.info("="*60)
-        self.logger.info(f"Fusion Sniper Bot v3.0 (News Fetch Fix)")
+        self.logger.info("Fusion Sniper Bot v4.1")
         self.logger.info(f"Symbol: {self.symbol}")
         self.logger.info("="*60)
         self.logger.info(f"Magic number: {self.magic_number}")
         self.logger.info(f"Lot size: {self.lot_size}")
         self.logger.info(f"Max Concurrent Positions: {self.max_positions}")
-        self.logger.info(f"Stop/TP Mode: ATR-Based (Dynamic)")
+        self.logger.info("Stop/TP Mode: ATR-Based (Dynamic)")
         self.logger.info(f"  SL Multiplier: {self.config['TRADING'].get('stop_loss_atr_multiple', 1.0)}x ATR")
         self.logger.info(f"  TP Multiplier: {self.config['TRADING'].get('take_profit_atr_multiple', 2.0)}x ATR")
         
         # Log break-even settings
         if self.use_breakeven:
-            self.logger.info(f"Break-Even: ENABLED (ATR-based)")
+            self.logger.info("Break-Even: ENABLED (ATR-based)")
             self.logger.info(f"  Trigger: {self.breakeven_trigger_multiple}x ATR profit")
             self.logger.info(f"  Lock: {self.breakeven_lock_multiple}x ATR profit")
         
@@ -194,8 +193,8 @@ class FusionSniperBot:
             self.logger.info(f"Scalp target: £{self.scalp_profit_target}")
             self.logger.info("="*50)
         
-        self.logger.info(f"News Filter: ENABLED (ForexFactory XML format)")
-        self.logger.info(f"News Fetch: Continuous (even when paused)")
+        self.logger.info("News Filter: ENABLED (ForexFactory XML format)")
+        self.logger.info("News Fetch: Continuous (even when paused)")
         
         self.telegram.notify_bot_started(self.symbol)
         
@@ -391,7 +390,6 @@ class FusionSniperBot:
         except Exception as e:
             # Fall back to console output if anything goes wrong here
             print(f"Error rotating log file: {e}")
-
 
     def initialize_mt5(self):
         """Initialize MT5 connection"""
@@ -652,27 +650,32 @@ class FusionSniperBot:
         except Exception as e:
             self.logger.error(f"Error getting market data: {e}")
             return None
+
+    def _has_open_positions_for_bot(self):
+        """Return True if there are any open positions for this bot on this symbol."""
+        try:
+            positions = mt5.positions_get(symbol=self.symbol)
+            if not positions:
+                return False
+            for pos in positions:
+                if pos.magic == self.magic_number:
+                    return True
+        except Exception as e:
+            self.logger.debug(f"Position lookup failed. {e}")
+        return False
     
     def check_daily_profit(self):
         """Check daily profit and update pause status. TIMEZONE AWARE + SWAP INCLUDED with pending loss and profit behaviour"""
         try:
-            # Ensure loss/profit-limit state attributes exist
-            if not hasattr(self, "loss_limit_pending"):
-                self.loss_limit_pending = False
-            if not hasattr(self, "loss_limit_triggered_time"):
-                self.loss_limit_triggered_time = None
-            if not hasattr(self, "profit_target_pending"):
-                self.profit_target_pending = False
-
             # Get timezone offset from config (default 0 if not specified)
             broker_timezone_offset = self.config.get('BROKER', {}).get('broker_timezone_offset', 0)
+            now_local = datetime.now()
             
             # Check if new day. reset pause flags (using LOCAL time for date check)
-            current_date = datetime.now().date()
+            current_date = now_local.date()
             if current_date != self.last_target_check_date:
                 self.daily_target_reached = False
                 self.loss_limit_pending = False
-                self.loss_limit_triggered_time = None
                 self.profit_target_pending = False
                 self.starting_equity_today = None  # reset starting equity tracker
                 self.last_target_check_date = current_date
@@ -685,10 +688,10 @@ class FusionSniperBot:
                 return True
             
             # Calculate today's profit. TIMEZONE ADJUSTED
-            local_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+            local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
             broker_today_start = local_midnight + timedelta(hours=broker_timezone_offset)
             broker_today_end = broker_today_start + timedelta(days=1) - timedelta(seconds=1)
-            broker_now = min(datetime.now() + timedelta(hours=broker_timezone_offset), broker_today_end)
+            broker_now = min(now_local + timedelta(hours=broker_timezone_offset), broker_today_end)
                         
             # Query MT5 with broker-adjusted times
             deals = mt5.history_deals_get(broker_today_start, broker_now)
@@ -717,16 +720,7 @@ class FusionSniperBot:
             net_profit = total_profit - total_commission + total_swap
 
             # Check if there are open positions for this bot on this symbol
-            has_open_positions_for_bot = False
-            try:
-                positions = mt5.positions_get(symbol=self.symbol)
-                if positions:
-                    for pos in positions:
-                        if pos.magic == self.magic_number:
-                            has_open_positions_for_bot = True
-                            break
-            except Exception as e:
-                self.logger.debug(f"Position lookup failed during daily loss/profit check. {e}")
+            has_open_positions_for_bot = self._has_open_positions_for_bot()
             
             # --- DAILY LOSS LIMIT ENFORCEMENT ---
             loss_breached = False
@@ -819,7 +813,6 @@ class FusionSniperBot:
                         # Loss has recovered above threshold. clear and resume
                         self.logger.info("Loss limit recovered after positions closed. resuming trading for today.")
                         self.loss_limit_pending = False
-                        self.loss_limit_triggered_time = None
                         # fall through to profit target logic
 
             # No previous pending loss state. handle a fresh loss breach
@@ -827,7 +820,6 @@ class FusionSniperBot:
                 if has_open_positions_for_bot:
                     # Soft lock. wait for these positions to close
                     self.loss_limit_pending = True
-                    self.loss_limit_triggered_time = datetime.now()
                     self.logger.info("=" * 60)
                     self.logger.info("DAILY LOSS LIMIT BREACHED WITH OPEN POSITIONS")
                     if account_currency:
@@ -910,7 +902,7 @@ class FusionSniperBot:
 
         except Exception as e:
             self.logger.error(f"Error checking daily profit. {e}")
-            return self.daily_target_reached or self.loss_limit_pending or getattr(self, "profit_target_pending", False)
+            return self.daily_target_reached or self.loss_limit_pending or self.profit_target_pending
     
     def is_in_cooldown(self):
         """Check trade cooldown"""
@@ -976,7 +968,7 @@ class FusionSniperBot:
             
             exit_deal = None
             for deal in deals:
-                if deal.entry == 1:
+                if deal.entry == mt5.DEAL_ENTRY_OUT:
                     exit_deal = deal
             
             if exit_deal is None:
@@ -988,7 +980,7 @@ class FusionSniperBot:
             entry_price = pos_data['entry']
             
             if exit_deal.comment == "scalp_quick_profit":
-                reason = f"Quick scalp profit"
+                reason = "Quick scalp profit"
             else:
                 reason = self.determine_close_reason(exit_price, pos_data['sl'], pos_data['tp'], direction)
             
@@ -1355,7 +1347,7 @@ class FusionSniperBot:
                             self.logger.info(f"[HEARTBEAT] Bot alive | {status_msg}")
                     
                     time.sleep(60)
-                    continue
+                    return
                 
                 if last_status_message != status_msg:
                     self.logger.info(f"[OPEN] {status_msg}")
@@ -1420,7 +1412,7 @@ class FusionSniperBot:
                 position_count = len([p for p in positions if p.magic == self.magic_number])
                 
                 if target_reached:
-                    self.logger.info(f"[PAUSED] Daily target reached | Managing {position_count} position(s)")
+                    self.logger.info(f"[PAUSED] Daily limit active | Managing {position_count} position(s)")
                 else:
                     self.logger.info(f"Scanning market... (Positions: {position_count})")
                 
@@ -1527,4 +1519,3 @@ if __name__ == "__main__":
     
     bot = FusionSniperBot(config_file)
     bot.run()
-    
