@@ -103,15 +103,17 @@ class FusionSniperBot:
         self.monday_open_hour = trading_hours.get('monday_open_hour', 0)
         self.sunday_open_hour = trading_hours.get('sunday_open_hour', 22)
         self.friday_close_hour = trading_hours.get('friday_close_hour', 22)
-        
+
+        # Daily profit tracking (PAUSE mode instead of shutdown)
+        self.daily_profit_target = self.config['TRADING'].get('daily_profit_target', 0)
+        self.daily_target_reached = False
+        self.last_target_check_date = datetime.now().date()
+        self.starting_equity_today = None  # Track starting equity for loss limit
+
         # Daily loss / profit pending state so we can recheck after open trades close
         self.loss_limit_pending = False
         self.loss_limit_triggered_time = None
         self.profit_target_pending = False
-
-        # Daily loss.pending state so we can recheck after open trades close
-        self.loss_limit_pending = False
-        self.loss_limit_triggered_time = None
 
         # Loop timing from config
         system_cfg = self.config.get('SYSTEM', {})
