@@ -104,11 +104,10 @@ class FusionSniperBot:
         self.sunday_open_hour = trading_hours.get('sunday_open_hour', 22)
         self.friday_close_hour = trading_hours.get('friday_close_hour', 22)
         
-        # Daily profit tracking (PAUSE mode instead of shutdown)
-        self.daily_profit_target = self.config['TRADING'].get('daily_profit_target', 0)
-        self.daily_target_reached = False
-        self.last_target_check_date = datetime.now().date()
-        self.starting_equity_today = None  # Track starting equity for loss limit
+        # Daily loss / profit pending state so we can recheck after open trades close
+        self.loss_limit_pending = False
+        self.loss_limit_triggered_time = None
+        self.profit_target_pending = False
 
         # Daily loss.pending state so we can recheck after open trades close
         self.loss_limit_pending = False
@@ -653,13 +652,15 @@ class FusionSniperBot:
             return None
     
     def check_daily_profit(self):
-        """Check daily profit and update pause status. TIMEZONE AWARE + SWAP INCLUDED with pending loss behaviour"""
+        """Check daily profit and update pause status. TIMEZONE AWARE + SWAP INCLUDED with pending loss and profit behaviour"""
         try:
-            # Ensure loss-limit state attributes exist
+            # Ensure loss/profit-limit state attributes exist
             if not hasattr(self, "loss_limit_pending"):
                 self.loss_limit_pending = False
             if not hasattr(self, "loss_limit_triggered_time"):
                 self.loss_limit_triggered_time = None
+            if not hasattr(self, "profit_target_pending"):
+                self.profit_target_pending = False
 
             # Get timezone offset from config (default 0 if not specified)
             broker_timezone_offset = self.config.get('BROKER', {}).get('broker_timezone_offset', 0)
@@ -670,6 +671,7 @@ class FusionSniperBot:
                 self.daily_target_reached = False
                 self.loss_limit_pending = False
                 self.loss_limit_triggered_time = None
+                self.profit_target_pending = False
                 self.starting_equity_today = None  # reset starting equity tracker
                 self.last_target_check_date = current_date
                 self.logger.info("NEW DAY. Daily profit/loss logic reset (Local timezone)")
@@ -691,7 +693,7 @@ class FusionSniperBot:
             
             if deals is None:
                 self.logger.debug("  No deals returned from MT5")
-                return self.daily_target_reached or self.loss_limit_pending
+                return self.daily_target_reached or self.loss_limit_pending or self.profit_target_pending
             
             # Calculate NET profit (only count exit deals to avoid double-counting)
             total_profit = 0.0
@@ -722,7 +724,7 @@ class FusionSniperBot:
                             has_open_positions_for_bot = True
                             break
             except Exception as e:
-                self.logger.debug(f"Position lookup failed during daily loss check. {e}")
+                self.logger.debug(f"Position lookup failed during daily loss/profit check. {e}")
             
             # --- DAILY LOSS LIMIT ENFORCEMENT ---
             loss_breached = False
@@ -818,7 +820,7 @@ class FusionSniperBot:
                         self.loss_limit_triggered_time = None
                         # fall through to profit target logic
 
-            # No previous pending state. handle a fresh loss breach
+            # No previous pending loss state. handle a fresh loss breach
             if loss_breached and cap is not None and not self.daily_target_reached:
                 if has_open_positions_for_bot:
                     # Soft lock. wait for these positions to close
@@ -845,27 +847,68 @@ class FusionSniperBot:
                     return True
 
             # --- DAILY PROFIT TARGET ENFORCEMENT ---
-            # Only applies if you have set a positive target in config
-            if self.daily_profit_target > 0 and net_profit >= self.daily_profit_target:
-                self.daily_target_reached = True
-                self.logger.info("=" * 60)
-                self.logger.info(f"DAILY PROFIT TARGET REACHED. £{net_profit:.2f}")
-                self.logger.info("Bot will PAUSE new trades until midnight (00:00 Local)")
-                self.logger.info("Existing positions will still be managed")
-                self.logger.info("=" * 60)
-                try:
-                    self.telegram.notify_daily_target_reached(self.symbol, net_profit, self.daily_profit_target)
-                except Exception:
-                    pass
-                return True
+            profit_target_breached = False
+            if self.daily_profit_target > 0:
+                if net_profit >= self.daily_profit_target:
+                    profit_target_breached = True
+
+            # Handle existing pending profit state
+            if self.profit_target_pending:
+                if has_open_positions_for_bot:
+                    # Still waiting for positions to close. block new trades
+                    return True
+                else:
+                    # All positions closed. confirm or cancel profit pause
+                    if profit_target_breached:
+                        self.daily_target_reached = True
+                        self.profit_target_pending = False
+                        self.logger.info("=" * 60)
+                        self.logger.info("DAILY PROFIT TARGET CONFIRMED AFTER POSITIONS CLOSED")
+                        self.logger.info(f"Net profit today. £{net_profit:.2f} (target £{self.daily_profit_target:.2f})")
+                        self.logger.info("Bot will PAUSE new trades until midnight (00:00 Local)")
+                        self.logger.info("=" * 60)
+                        try:
+                            self.telegram.notify_daily_target_reached(self.symbol, net_profit, self.daily_profit_target)
+                        except Exception:
+                            pass
+                        return True
+                    else:
+                        # Profit has fallen back below target. resume trading
+                        self.logger.info("Daily profit dropped back below target after positions closed. resuming trading for today.")
+                        self.profit_target_pending = False
+                        # fall through
+
+            # Fresh profit target breach and no existing pending state
+            if profit_target_breached and not self.daily_target_reached:
+                if has_open_positions_for_bot:
+                    # Soft lock. wait for these positions to close
+                    self.profit_target_pending = True
+                    self.logger.info("=" * 60)
+                    self.logger.info("DAILY PROFIT TARGET REACHED WITH OPEN POSITIONS")
+                    self.logger.info(f"Current net profit. £{net_profit:.2f} (target £{self.daily_profit_target:.2f})")
+                    self.logger.info("Pausing NEW trades until existing positions for this bot are closed. profit will then be re-evaluated.")
+                    self.logger.info("=" * 60)
+                    return True
+                else:
+                    # Hard daily profit stop straight away
+                    self.daily_target_reached = True
+                    self.logger.info("=" * 60)
+                    self.logger.info(f"DAILY PROFIT TARGET REACHED. £{net_profit:.2f}")
+                    self.logger.info("Bot will PAUSE new trades until midnight (00:00 Local)")
+                    self.logger.info("Existing positions will still be managed")
+                    self.logger.info("=" * 60)
+                    try:
+                        self.telegram.notify_daily_target_reached(self.symbol, net_profit, self.daily_profit_target)
+                    except Exception:
+                        pass
+                    return True
             
             # If none of the conditions fired, only pause if a flag is set
-            return self.daily_target_reached or self.loss_limit_pending
+            return self.daily_target_reached or self.loss_limit_pending or self.profit_target_pending
 
         except Exception as e:
             self.logger.error(f"Error checking daily profit. {e}")
-            return self.daily_target_reached or self.loss_limit_pending
-
+            return self.daily_target_reached or self.loss_limit_pending or getattr(self, "profit_target_pending", False)
     
     def is_in_cooldown(self):
         """Check trade cooldown"""
