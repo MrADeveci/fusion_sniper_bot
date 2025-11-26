@@ -93,7 +93,7 @@ class FusionSniperBot:
         
         # Cooldown tracking
         self.last_trade_time = None
-               self.last_trade_type = None
+        self.last_trade_type = None
         self.trade_cooldown = self.config['TRADING'].get('trade_cooldown_seconds', 60)
         
         # Trading hours from config
@@ -1347,7 +1347,7 @@ class FusionSniperBot:
                             self.logger.info(f"[HEARTBEAT] Bot alive | {status_msg}")
                     
                     time.sleep(60)
-                    return
+                    continue
                 
                 if last_status_message != status_msg:
                     self.logger.info(f"[OPEN] {status_msg}")
