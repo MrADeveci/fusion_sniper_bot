@@ -1,5 +1,5 @@
 """
-Risk Manager - C79 Sniper Bot
+Risk Manager - Fusion Sniper Bot
 Manages position sizing and risk parameters
 UPDATED: All settings now read from config.json
 """

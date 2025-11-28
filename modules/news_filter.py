@@ -1,5 +1,5 @@
 """
-Economic News Filter - C79 Sniper Trading Bot
+Economic News Filter - Fusion Sniper Bot
 Filters high-impact economic news to avoid volatile periods
 UPDATED: All settings now read from config.json - ForexFactory XML format
 """
@@ -261,6 +261,6 @@ class EconomicNewsFilter:
 
 if __name__ == "__main__":
     # Test module
-    print("C79 Sniper - Economic News Filter Module")
+    print("Fusion Sniper Bot - Economic News Filter Module")
     print("This module filters high-impact economic news")
     print("Import this into your main bot to use news filtering")

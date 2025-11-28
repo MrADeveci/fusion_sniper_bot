@@ -1,5 +1,5 @@
 """
-Trade Statistics Tracker - C79 Sniper Bot
+Trade Statistics Tracker - Fusion Sniper Bot
 Tracks and analyzes trading performance
 UPDATED: All settings now read from config.json
 """
@@ -268,6 +268,6 @@ class TradeStatistics:
 
 if __name__ == "__main__":
     # Test module
-    print("C79 Sniper - Trade Statistics Module")
+    print("Fusion Sniper Bot - Trade Statistics Module")
     print("This module tracks and analyzes trading performance")
     print("Import this into your main bot to use statistics tracking")
