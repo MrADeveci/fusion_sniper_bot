@@ -1,9 +1,6 @@
 """
-Watchdog Monitor - C79 Sniper Trading Bot
+Watchdog Monitor - Fusion Sniper Trading Bot
 Monitors bot health and restarts if necessary
-UPDATED: All settings now read from config.json
-FIXED: Proper handling of trading_hours from config
-FIXED: Prevents duplicate bot startup during initialization
 """
 
 import time
@@ -153,7 +150,7 @@ class WatchdogMonitor:
             
             wt_command = [
                 'wt', '-w', '0', 'nt',
-                '--title', f'C79 Sniper Bot - {symbol}',
+                '--title', f'Fusion Sniper Bot - {symbol}',
                 '--tabColor', '#00FF00',
                 '-d', bot_dir,
                 'cmd', '/c',
