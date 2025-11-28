@@ -102,19 +102,39 @@ Status: <i>Active and monitoring</i>"""
     def notify_trade_opened(self, symbol, direction, lot_size, entry_price, sl_price, tp_price, magic_number=None):
         """
         Notify when a trade is opened - UPDATED WITH EMOJIS
-        
+
         Args:
             symbol (str): Trading pair
             direction (str): BUY or SELL
             lot_size (float): Position size in lots
-            entry_price (float): Entry price
-            sl_price (float): Stop loss price
-            tp_price (float): Take profit price
+            entry_price (float | str): Entry price
+            sl_price (float | str): Stop loss price
+            tp_price (float | str): Take profit price
             magic_number (int): Magic number (optional, not used in message)
         """
         # Use arrow indicators
         direction_emoji = "📈" if direction == "BUY" else "📉"
-        
+
+        # Work out how many decimal places to show from the entry price
+        entry_str = str(entry_price)
+        if "." in entry_str:
+            decimals = len(entry_str.split(".")[1])
+        else:
+            decimals = 0
+
+        price_format = f"{{:.{decimals}f}}"
+
+        # Format SL / TP to match the entry precision
+        if isinstance(sl_price, (int, float)):
+            sl_str = price_format.format(sl_price)
+        else:
+            sl_str = str(sl_price)
+
+        if isinstance(tp_price, (int, float)):
+            tp_str = price_format.format(tp_price)
+        else:
+            tp_str = str(tp_price)
+
         message = f"""{direction_emoji} <b>Trade Opened</b>
 
 📊 <b>Pair:</b> {symbol}
@@ -122,11 +142,11 @@ Status: <i>Active and monitoring</i>"""
 
 📦 <b>Lot Size:</b> {lot_size}
 
-🎯 <b>Entry:</b> {entry_price}
+🎯 <b>Entry:</b> {entry_str}
 
-🛡️ <b>Stop Loss:</b> {sl_price}
-💰 <b>Take Profit:</b> {tp_price}"""
-        
+🛡️ <b>Stop Loss:</b> {sl_str}
+💰 <b>Take Profit:</b> {tp_str}"""
+
         self.send_message(message)
     
     def notify_trade_closed(self, symbol, direction, lot_size, entry_price, exit_price, profit, reason):
