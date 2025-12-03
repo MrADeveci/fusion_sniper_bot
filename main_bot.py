@@ -103,6 +103,8 @@ class FusionSniperBot:
         self.monday_open_hour = trading_hours.get('monday_open_hour', 0)
         self.sunday_open_hour = trading_hours.get('sunday_open_hour', 22)
         self.friday_close_hour = trading_hours.get('friday_close_hour', 22)
+        self.weekday_open_hour = trading_hours.get('weekday_open_hour', None)
+        self.weekday_close_hour = trading_hours.get('weekday_close_hour', None)
 
         # Daily profit tracking (PAUSE mode instead of shutdown)
         self.daily_profit_target = self.config['TRADING'].get('daily_profit_target', 0)
@@ -572,8 +574,8 @@ class FusionSniperBot:
                 hours_until_open = (sunday_open - now).total_seconds() / 3600
                 return False, f"Market CLOSED - {current_day} {now.strftime('%H:%M')} | Opens today at {self.sunday_open_hour:02d}:00 (in {hours_until_open:.1f} hours)"
         
-        # Friday after closing hour
-        if weekday == 4 and hour >= self.friday_close_hour:
+        # Friday after closing hour. only if we actually close on the weekend
+        if weekday == 4 and hour >= self.friday_close_hour and (self.saturday_closed or self.sunday_closed):
             if self.sunday_closed:
                 # Sunday closed - open Monday
                 monday_open = now.replace(hour=self.monday_open_hour, minute=0, second=0, microsecond=0) + timedelta(days=3)
@@ -584,7 +586,16 @@ class FusionSniperBot:
                 sunday_open = now.replace(hour=self.sunday_open_hour, minute=0, second=0, microsecond=0) + timedelta(days=2)
                 hours_until_open = (sunday_open - now).total_seconds() / 3600
                 return False, f"Market CLOSED - {current_day} after {self.friday_close_hour:02d}:00 | Opens Sunday {self.sunday_open_hour:02d}:00 (in {hours_until_open:.1f} hours)"
-        
+
+        # Generic daily open/close window if configured
+        if self.weekday_open_hour is not None and self.weekday_close_hour is not None:
+            if hour < self.weekday_open_hour or hour >= self.weekday_close_hour:
+                return False, (
+                    f"Market CLOSED - {current_day} {now.strftime('%H:%M')} | "
+                    f"Daily window {self.weekday_open_hour:02d}:00-"
+                    f"{self.weekday_close_hour:02d}:00"
+                )
+
         return True, f"Market OPEN - {current_day} {now.strftime('%H:%M')}"
 
     def is_in_swap_avoidance_window(self):
