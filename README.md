@@ -6,6 +6,7 @@ It is currently tuned and used for:
 
 - XAUUSD (Gold)
 - BTCUSD (Bitcoin)
+- EURUSD (Euro vs USD)
 
 The bot runs on Windows, connects directly to MT5, applies a configurable technical strategy, manages risk, filters high impact economic news and sends rich Telegram notifications and health updates.
 
@@ -72,7 +73,6 @@ fusion_sniper_bot/
 - `services/` . supporting long running services
   - `telegram_command_handler.py` . `TelegramCommandHandler` for remote control
   - `watchdog_monitor.py` . `WatchdogMonitor` to keep the bot healthy
-- `legacy/` . older components retained for reference. not used in the main flow
 
 ---
 
@@ -221,14 +221,6 @@ Lightweight watchdog process that ensures the main bot stays healthy.
 - Cleans up old cache files such as stale news events
 - Windows specific. uses `tasklist` and `subprocess.CREATE_NO_WINDOW`
 
-### `legacy/` components
-
-The `legacy` folder contains older, now superseded modules.  
-They are retained for reference and are not part of the normal run pipeline.
-
-- `legacy/daily_profit_manager.py` . earlier implementation of daily profit logic
-- `legacy/mt5_connector.py` . earlier connector abstraction around MetaTrader 5
-
 ---
 
 ## Requirements
@@ -282,45 +274,66 @@ You would create one config per account or per symbol.
   "BROKER": {
     "symbol": "XAUUSD",
     "magic_number": 234000,
-    "account": 111111111,
+    "account": 0000001,
     "password": "YOUR_MT5_PASSWORD",
     "server": "YourBroker-Server",
-    "mt5_path": "C:\fusion_sniper_bot_xau_111111111\MT5\terminal64.exe",
+    "mt5_path": "C:\fs_demo_xauusd_0000001\MT5\terminal64.exe",
     "broker_timezone_offset": 2
   },
 
   "TRADING": {
     "timeframe": "M15",
-    "lot_size": 0.70,
-
-    "max_positions": 3,
-
+    "lot_size": 0.7,
+    
+    "_comment_positions": "Maximum Concurrent Positions",
+    "max_positions": 2,
+    
+    "_comment_stops": "Stop Loss & Take Profit Settings",
     "use_atr_based_stops": true,
-    "stop_loss_atr_multiple": 0.45,
+    "stop_loss_atr_multiple": 0.40,
     "take_profit_atr_multiple": 2.0,
-
+    
+    "_comment_breakeven": "Smart Break-Even Settings",
     "use_smart_breakeven": true,
-    "breakeven_profit_multiple": 0.7,
+    "breakeven_profit_multiple": 0.6,
     "breakeven_lock_profit_multiple": 0.3,
-
+    
+    "_comment_trailing": "Trailing Stop Settings",
     "use_trailing_stop": true,
     "trailing_stop_type": "chandelier",
     "trailing_stop_atr_multiple": 2.0,
-    "min_profit_for_trail_activation": 1.5,
-
+    "min_profit_for_trail_activation": 1.8,
+    
+    "_comment_cooldown": "Trade Cooldown Settings",
     "trade_cooldown_seconds": 60,
-
-    "daily_profit_target": 300.0,
-
+    
+    "_comment_profit": "Daily Profit Target",
+    "daily_profit_target": 127,
+    
+    "_comment_volatility": "Volatility Detection & Scalping",
     "volatility_detection": {
       "enabled": true,
       "atr_period": 14,
       "atr_scalp_threshold": 2.0,
-      "scalp_profit_target_gbp": 40.0,
+      "scalp_profit_target_gbp": 48.66,
       "scalp_cooldown_seconds": 30,
-      "normal_cooldown_seconds": 60
+      "normal_cooldown_seconds": 60,
+      "_comment_limits": "ATR based risk limits",
+      "skip_trading_when_atr_extreme": true,
+      "atr_max_for_trading": 20.0
     },
-
+    
+    "_comment_orders": "Order Execution Settings",
+    "order_execution": {
+      "deviation": 10,
+      "comment": "fusion_sniper_bot",
+      "scalp_comment": "scalp_quick_profit",
+      "emergency_rr_ratio": 2.0,
+      "tolerance_pips": 2,
+      "market_data_bars": 250
+    },
+    
+    "_comment_hours": "Trading Hours - UK time (Monday 01:00 - Friday 23:00, Sunday CLOSED)",
     "trading_hours": {
       "saturday_closed": true,
       "sunday_closed": true,
@@ -329,36 +342,195 @@ You would create one config per account or per symbol.
       "friday_close_hour": 23
     }
   },
-
+  
   "RISK": {
-    "max_risk_per_trade": 2.0,
-    "max_daily_loss": 400.0,
+    "_comment_daily": "Daily loss protection in account currency",
+    "max_risk_per_trade": 1.5,
+    "max_daily_loss": 210,
     "max_daily_loss_currency": "GBP",
     "loss_limit_by_equity": true,
+    
+    "_comment_weekly": "Weekly NET P&L caps in account currency. closed trades + swap - commission",
+    "weekly_limits_enabled": true,
+    "max_weekly_profit": 350,
+    "max_weekly_loss": 411,
+    "week_start_day": "monday",
+    
     "max_drawdown_percent": 10.0,
-    "max_positions_per_bot": 3
+    "max_positions_per_bot": 2,
+    
+    "_comment_confidence": "Confidence-Based Position Sizing",
+    "confidence_based_scaling": {
+      "enabled": false,
+      "min_confidence": 0.6,
+      "high_confidence_threshold": 0.8,
+      "scaling_range": {
+        "min_multiplier": 0.5,
+        "max_multiplier": 1.0
+      }
+    }
   },
-
+  
   "STRATEGY": {
-    "min_conditions_required": 3,
-    "debug_signals": false,
-
+    "_comment_ema": "EMA Settings",
     "ema_20_period": 20,
     "ema_50_period": 50,
     "ema_100_period": 100,
     "ema_200_period": 200,
-
+    
+    "_comment_rsi": "RSI Settings",
     "rsi_period": 14,
     "rsi_oversold": 40,
-    "rsi_overbought": 60
+    "rsi_overbought": 60,
+    
+    "_comment_atr": "ATR Settings",
+    "atr_period": 14,
+    "atr_multiplier": 1.5,
+    
+    "_comment_macd": "MACD Settings",
+    "macd_fast_period": 12,
+    "macd_slow_period": 26,
+    "macd_signal_period": 9,
+    
+    "_comment_bb": "Bollinger Bands Settings",
+    "bb_period": 20,
+    "bb_std_dev": 2,
+    
+    "_comment_conditions": "Signal Generation - Minimum conditions required for trade entry",
+    "min_conditions_required": 3,
+    "debug_signals": false,
+    
+    "_comment_technical": "Technical Analysis Parameters",
+    "technical_analysis": {
+      "swing_detection_threshold": 0.0015,
+      "candle_body_ratio": 0.6,
+      "exhaustion_wick_ratio": 2.0,
+      "breakout_volume_threshold": 1.5,
+      "support_resistance_tolerance": 0.0005,
+      "min_distance_from_sr": 0.001
+    }
   },
-
+  
   "TELEGRAM": {
+    "bot_token": "******************",
+    "chat_id": "******************",
+    "authorized_user_ids": ["******************"],
     "enabled": true,
-    "bot_token": "123456789:ABCDEF...",
-    "chat_id": "123456789",
-    "authorized_user_ids": ["123456789"],
+    
+    "_comment_api": "Telegram API Settings",
     "api_timeout_seconds": 10
+  },
+  
+  "TELEGRAM_HANDLER": {
+    "_comment": "Telegram command handler settings",
+    
+    "_comment_paths": "File Paths",
+    "paths": {
+      "log_file": "logs/telegram_handler.log",
+      "bot_status_file": "logs/bot_status.json",
+      "manual_stop_flag": "logs/manual_stop.flag",
+      "trade_statistics_file": "logs/trade_statistics_{symbol}.json",
+      "news_events_file": "cache/news_events.json",
+      "log_directory": "logs"
+    },
+    
+    "_comment_timeouts": "Timeouts and Intervals",
+    "command_timeout_seconds": 30,
+    
+    "_comment_intervals": "Check Intervals",
+    "intervals": {
+      "bot_startup_check": 1,
+      "process_wait": 2
+    },
+    
+    "_comment_health": "Health Check Thresholds",
+    "health_thresholds": {
+      "log_active_minutes": 5,
+      "log_warning_minutes": 60,
+      "margin_safe_level": 500,
+      "margin_warning_level": 200
+    },
+    
+    "_comment_display": "Display Settings",
+    "display": {
+      "news_forecast_hours": 24,
+      "max_news_events": 5
+    }
+  },
+  
+  "NEWS_FILTER": {
+    "enabled": true,
+    "api_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+    "buffer_before_minutes": 30,
+    "buffer_after_minutes": 30,
+    "check_interval_seconds": 300,
+    "impact_levels": ["High", "Holiday"],
+    "monitored_currencies": ["USD"],
+  
+    "_comment_notifications": "News Notification Settings",
+    "notify_on_news_avoidance": true,
+  
+    "_comment_weekly": "Weekly Planning Summary (Sunday before market open)",
+    "weekly_summary_enabled": true,
+    "weekly_summary_day": 6,
+    "weekly_summary_hour_gmt": 22,
+    "holiday_buffer_hours": 12,
+  
+    "_comment_cache": "Cache Settings",
+    "cache_directory": "cache",
+    "cache_max_age_minutes": 10,
+    "cache_file": "cache/news_events.json",
+    "cache_validity_hours": 6,
+    "cache_retention_days": 7,
+    "api_timeout_seconds": 10,
+    
+    "_comment_retry": "Retry Logic",
+    "max_retries": 3,
+    "retry_delay_seconds": 2
+  },
+  
+  "STATISTICS": {
+    "enabled": true,
+    "stats_file_path": "logs/trade_statistics_{symbol}.json",
+    "max_history": 100,
+    
+    "_comment_tracking": "What to Track",
+    "track_mae": true,
+    "track_mfe": true,
+    "track_session_performance": true,
+    "track_exit_reasons": true
+  },
+  
+  "WATCHDOG": {
+    "_comment": "Watchdog monitor settings",
+    "check_interval_seconds": 300,
+
+    "_comment_hours": "Trading Hours - UK time (Monday 01:00 - Friday 23:00, Sunday CLOSED)",
+    "trading_hours": {
+    "saturday_closed": true,
+    "sunday_closed": true,
+    "monday_open_hour": 1,
+    "sunday_open_hour": 23,
+    "friday_close_hour": 23
+},
+    
+    "_comment_cache": "Cache Retention",
+    "cache_retention_hours": 168
+  },
+  
+  "SYSTEM": {
+    "_comment": "System-wide settings",
+    "_comment_paths": "File Paths",
+    "log_directory": "logs",
+    "bot_status_file": "logs/bot_status.json",
+    "_comment_logging": "Logging Configuration",
+    "log_format": "%(asctime)s - %(levelname)s - %(message)s",
+    "log_retention_days": 7,
+    "_comment_timing": "Loop Timing (seconds)",
+    "main_loop_interval": 1,
+    "paused_loop_interval": 300,
+    "idle_sleep_interval": 60,
+    "waiting_log_interval": 300
   }
 }
 ```
@@ -407,14 +579,14 @@ All pointed at the same folder.
 A common layout for running multiple accounts or symbols is:
 
 ```text
-C:\fusion_sniper_bot\                    # main codebase linked to GitHub
+C:\fusion_sniper_bot\                    # main codebase linked to GitHub
 
-C:\fusion_sniper_bot_xau_1111111\       # XAUUSD instance for account 52576068
+C:\fs_live_xauusd_00000001\       # XAUUSD instance for account 00000001
   MT5\                                   # portable MT5 for that account
   main_bot.py
   config.json                            # XAU config
   modules  services  logs
-C:\fusion_sniper_bot_btc_1111111\       # BTCUSD instance for account 52617101
+C:\fs_live_btcusd_00000002\        # BTCUSD instance for account 00000002
   MT5\                                   # portable MT5 for that account
   main_bot.py
   config.json                            # BTC config
@@ -422,7 +594,7 @@ C:\fusion_sniper_bot_btc_1111111\       # BTCUSD instance for account 52617101
 
 Workflow.
 
-- Develop and version control the code in `C:\fusion_sniper_bot`
+- Develop and version control the code in `C:\fusion_sniper_bot`
 - When you are happy with a version. copy updated Python files into each runtime folder without overwriting:
   - `config.json`
   - `MT5\`
