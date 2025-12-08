@@ -297,7 +297,56 @@ Status: <i>Active and monitoring</i>"""
 <i>Check bot logs for more details</i>"""
         
         self.send_message(message)
-    
+
+
+    def notify_weekly_profit_limit(self, symbol, weekly_profit, limit):
+        """
+        Notify when the weekly profit cap is reached
+
+        Args:
+            symbol (str): Trading pair
+            weekly_profit (float): Current net weekly profit
+            limit (float): Weekly profit cap
+        """
+        timestamp = datetime.now().strftime("%d/%m/%Y %I:%M:%S %p")
+
+        message = f"""✅ <b>Weekly Profit Limit Reached</b>
+
+📊 <b>Pair:</b> {symbol}
+
+💰 <b>Net weekly profit:</b> +£{weekly_profit:.2f}
+🎯 <b>Weekly profit cap:</b> £{limit:.2f}
+
+⏰ <b>Time:</b> {timestamp}
+
+<i>Great job this week, now go treat yourself.</i>"""
+
+        self.send_message(message)
+
+    def notify_weekly_loss_limit(self, symbol, weekly_profit, limit):
+        """
+        Notify when the weekly loss cap is reached
+
+        Args:
+            symbol (str): Trading pair
+            weekly_profit (float): Current net weekly profit. negative value
+            limit (float): Weekly loss cap as positive number
+        """
+        timestamp = datetime.now().strftime("%d/%m/%Y %I:%M:%S %p")
+
+        message = f"""⚠️ <b>Weekly Loss Limit Reached</b>
+
+📊 <b>Pair:</b> {symbol}
+
+💸 <b>Net weekly profit:</b> £{weekly_profit:.2f}
+⚠️ <b>Weekly loss cap:</b> £{limit:.2f}
+
+⏰ <b>Time:</b> {timestamp}
+
+<i>Sometimes, shit happens. Next week, we go again!</i>"""
+
+        self.send_message(message)
+     
     def notify_connection_lost(self, symbol):
         """
         Notify when MT5 connection is lost

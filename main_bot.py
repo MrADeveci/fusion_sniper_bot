@@ -112,14 +112,25 @@ class FusionSniperBot:
         self.last_target_check_date = datetime.now().date()
         self.starting_equity_today = None  # Track starting equity for loss limit
 
-        # Daily loss / profit pending state so we can recheck after open trades close
+        # Daily loss or profit pending state so we can recheck after open trades close
         self.loss_limit_pending = False
         self.profit_target_pending = False
+
+        # Weekly profit or loss limits
+        risk_cfg = self.config.get('RISK', {})
+        self.weekly_limits_enabled = risk_cfg.get('weekly_limits_enabled', False)
+        self.max_weekly_profit = risk_cfg.get('max_weekly_profit', 0.0)
+        self.max_weekly_loss = risk_cfg.get('max_weekly_loss', 0.0)
+        self.week_start_day = risk_cfg.get('week_start_day', 'monday').lower()
+        self.weekly_limit_triggered = False    # True once weekly cap is hit
+        self.weekly_limit_side = None          # 'profit' or 'loss'
+        self.last_week_start_date = None       # broker week start date used for reset
 
         # Loop timing from config
         system_cfg = self.config.get('SYSTEM', {})
         self.main_loop_interval = system_cfg.get('main_loop_interval', 10)
         self.paused_loop_interval = system_cfg.get('paused_loop_interval', 30)
+
         
         # VOLATILITY DETECTION
         self.volatility_config = self.config['TRADING'].get('volatility_detection', {})
@@ -915,6 +926,120 @@ class FusionSniperBot:
             self.logger.error(f"Error checking daily profit. {e}")
             return self.daily_target_reached or self.loss_limit_pending or self.profit_target_pending
     
+    def check_weekly_limits(self):
+        """
+        Check weekly NET P&L against configured weekly caps.
+
+        NET P&L = profit from exit deals - commission from all deals + swap
+
+        Returns:
+            bool: True if weekly cap is active and bot should pause new trades
+        """
+        try:
+            risk_cfg = self.config.get('RISK', {})
+            if not risk_cfg.get('weekly_limits_enabled', False):
+                return False
+
+            max_weekly_profit = risk_cfg.get('max_weekly_profit', 0.0)
+            max_weekly_loss = risk_cfg.get('max_weekly_loss', 0.0)
+
+            if max_weekly_profit <= 0 and max_weekly_loss <= 0:
+                # No usable weekly caps set
+                return False
+
+            # Timezone handling similar to daily check
+            broker_timezone_offset = self.config.get('BROKER', {}).get('broker_timezone_offset', 0)
+            now_local = datetime.now()
+
+            # Broker now and "today start" in broker time
+            local_midnight = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+            broker_today_start = local_midnight + timedelta(hours=broker_timezone_offset)
+            broker_now = now_local + timedelta(hours=broker_timezone_offset)
+
+            # Work out week start in broker timezone
+            week_day_map = {
+                'monday': 0,
+                'tuesday': 1,
+                'wednesday': 2,
+                'thursday': 3,
+                'friday': 4,
+                'saturday': 5,
+                'sunday': 6,
+            }
+            week_start_index = week_day_map.get(self.week_start_day, 0)
+            current_weekday = broker_today_start.weekday()
+            days_since_week_start = (current_weekday - week_start_index) % 7
+            broker_week_start = broker_today_start - timedelta(days=days_since_week_start)
+
+            # Reset weekly state on new week
+            week_start_date = broker_week_start.date()
+            if self.last_week_start_date is None or self.last_week_start_date != week_start_date:
+                if self.last_week_start_date is not None:
+                    self.logger.info("NEW WEEK detected. resetting weekly risk state")
+                self.last_week_start_date = week_start_date
+                self.weekly_limit_triggered = False
+                self.weekly_limit_side = None
+
+            # If already locked for this week. keep blocking new trades
+            if self.weekly_limit_triggered:
+                return True
+
+            # Pull deals for this week in broker time
+            deals = mt5.history_deals_get(broker_week_start, broker_now)
+            if deals is None:
+                self.logger.debug("No deals returned for weekly limits calculation")
+                return False
+
+            total_profit = 0.0
+            total_commission = 0.0
+            total_swap = 0.0
+
+            # Count commission from all deals. profit or swap only from exit deals
+            for deal in deals:
+                if deal.magic == self.magic_number:
+                    total_commission += abs(deal.commission)
+                    if deal.entry == mt5.DEAL_ENTRY_OUT:
+                        total_profit += deal.profit
+                        total_swap += deal.swap
+
+            net_weekly_profit = total_profit - total_commission + total_swap
+
+            weekly_loss_hit = max_weekly_loss > 0 and net_weekly_profit <= -max_weekly_loss
+            weekly_profit_hit = max_weekly_profit > 0 and net_weekly_profit >= max_weekly_profit
+
+            if not weekly_loss_hit and not weekly_profit_hit:
+                return False
+
+            # Lock for the rest of the week
+            self.weekly_limit_triggered = True
+            self.weekly_limit_side = 'loss' if weekly_loss_hit else 'profit'
+
+            self.logger.info("=" * 60)
+            if weekly_loss_hit:
+                self.logger.info("WEEKLY LOSS LIMIT REACHED")
+                self.logger.info(f"Net weekly profit. £{net_weekly_profit:.2f} vs loss cap £{max_weekly_loss:.2f}")
+            else:
+                self.logger.info("WEEKLY PROFIT LIMIT REACHED")
+                self.logger.info(f"Net weekly profit. £{net_weekly_profit:.2f} vs profit cap £{max_weekly_profit:.2f}")
+            self.logger.info("Bot will PAUSE new trades for the rest of this trading week")
+            self.logger.info("=" * 60)
+
+            # Telegram alerts
+            try:
+                if weekly_loss_hit:
+                    self.telegram.notify_weekly_loss_limit(self.symbol, net_weekly_profit, max_weekly_loss)
+                else:
+                    self.telegram.notify_weekly_profit_limit(self.symbol, net_weekly_profit, max_weekly_profit)
+            except Exception:
+                # Telegram is optional. never break trading on notification failure
+                pass
+
+            return True
+
+        except Exception as e:
+            self.logger.error(f"Error in weekly limits check. {e}")
+            return False
+
     def is_in_cooldown(self):
         """Check trade cooldown"""
         if self.last_trade_time is None:
@@ -1387,6 +1512,10 @@ class FusionSniperBot:
                     self.logger.info(f"[NEWS FILTER] Avoiding trading: {news_event['title']}")
                 
                 target_reached = self.check_daily_profit()
+                
+                # Daily and weekly risk caps
+                daily_paused = self.check_daily_profit()
+                weekly_paused = self.check_weekly_limits()
 
                 # Check swap or rollover avoidance window (server time)
                 in_swap_window, swap_msg = self.is_in_swap_avoidance_window()
@@ -1430,10 +1559,11 @@ class FusionSniperBot:
                 if position_count > 0:
                     self.manage_positions()
                 
-                # Look for new trades. only when not paused by daily target, news, swap window, or extreme ATR
+                # Look for new trades. only when not paused by daily or weekly caps, news, swap window, or extreme ATR
                 if (
                     position_count < self.max_positions
-                    and not target_reached
+                    and not daily_paused
+                    and not weekly_paused
                     and not avoiding_news
                     and not in_swap_window
                     and not extreme_volatility
