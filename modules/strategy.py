@@ -98,21 +98,23 @@ class FusionStrategy:
             weekday = ts.weekday()  # Monday = 0 ... Sunday = 6
             hour = ts.hour
 
-
             window_cfg = (self.trend_filter or {}).get("window", {}) or {}
             target_weekday = int(window_cfg.get("weekday", 3))
             start_hour = int(window_cfg.get("start_hour", 0))
             end_hour = int(window_cfg.get("end_hour", 8))
 
-            # Active only inside the configured weekday and hour window
-            if weekday == target_weekday and start_hour <= hour < end_hour:
-                return True
-                return True
+            if weekday != target_weekday:
+                return False
+
+            # Active only inside the configured hour window.
+            # Supports windows that span midnight, e.g. 22:00 -> 02:00
+            if start_hour <= end_hour:
+                return start_hour <= hour < end_hour
+            return hour >= start_hour or hour < end_hour
+
         except Exception:
             # If anything goes wrong, do not apply special logic
             return False
-
-        return False
 
     def _is_trend_filter_active(self, current_time):
         """
