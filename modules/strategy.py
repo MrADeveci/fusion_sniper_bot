@@ -1,5 +1,5 @@
 """
-Fusion Sniper Bot Strategy v4.0
+Fusion Sniper Bot Strategy v4.2
 Independent BUY/SELL condition evaluation
 """
 
@@ -24,6 +24,37 @@ class FusionStrategy:
 
         # Trend-related condition labels (must match conditions_detail)
         self.trend_flags = {"ABOVE_TREND", "BELOW_TREND", "STRONG_TREND"}
+
+        # Trend filter configuration
+        # This can be enabled or disabled per symbol via config.json under STRATEGY.trend_filter.
+        # If no config is provided, a legacy time window is used to preserve existing behaviour.
+        default_trend_filter = {
+            "enabled": True,
+            "scope": "window",  # "window" or "always"
+            "window": {
+                "weekday": 3,      # 0=Mon ... 6=Sun
+                "start_hour": 0,
+                "end_hour": 8,
+            },
+            "require_trend_flag": True,
+            "buy_extra_conditions": 0,
+            "sell_extra_conditions": 1,
+        }
+
+        user_trend_filter = self.strategy_config.get("trend_filter", None)
+        if isinstance(user_trend_filter, dict):
+            merged = dict(default_trend_filter)
+            merged.update(user_trend_filter)
+            # Merge nested window config safely
+            window_cfg = dict(default_trend_filter.get("window", {}))
+            window_cfg.update(user_trend_filter.get("window", {}) or {})
+            merged["window"] = window_cfg
+            self.trend_filter = merged
+        elif user_trend_filter is None:
+            self.trend_filter = default_trend_filter
+        else:
+            # Invalid type, fall back to defaults
+            self.trend_filter = default_trend_filter
 
         # EMA parameters
         self.ema_fast = self.strategy_config.get("ema_fast_period", 21)
@@ -50,27 +81,32 @@ class FusionStrategy:
         self.bb_std = self.strategy_config.get("bollinger_std", 2)
 
     # ------------------------------------------------------------------
-    # Session / weekday helpers for Thursday Asia logic
+    # Trend filter helpers
     # ------------------------------------------------------------------
-    def _is_thursday_asia(self, current_time):
+    def _is_trend_filter_window_active(self, current_time):
         """
-        Return True if current_time falls in the Thursday Asia session.
+        Return True if current_time falls inside the configured trend-filter window.
 
-        Assumes current_time is already in the timezone you use for trading
-        logic (for example broker or server time).
-        The hour range here is a simple Asia session approximation and can
-        be adjusted if needed.
+        The window is configured via STRATEGY.trend_filter.window and is evaluated
+        using the timestamp passed into this strategy (typically broker or server time).
         """
         try:
             if current_time is None or pd.isna(current_time):
                 return False
 
             ts = pd.to_datetime(current_time)
-            weekday = ts.weekday()  # Monday = 0 ... Thursday = 3
+            weekday = ts.weekday()  # Monday = 0 ... Sunday = 6
             hour = ts.hour
 
-            # Asia session approximation: 00:00 <= hour < 08:00 on Thursday
-            if weekday == 3 and 0 <= hour < 8:
+
+            window_cfg = (self.trend_filter or {}).get("window", {}) or {}
+            target_weekday = int(window_cfg.get("weekday", 3))
+            start_hour = int(window_cfg.get("start_hour", 0))
+            end_hour = int(window_cfg.get("end_hour", 8))
+
+            # Active only inside the configured weekday and hour window
+            if weekday == target_weekday and start_hour <= hour < end_hour:
+                return True
                 return True
         except Exception:
             # If anything goes wrong, do not apply special logic
@@ -78,30 +114,60 @@ class FusionStrategy:
 
         return False
 
+    def _is_trend_filter_active(self, current_time):
+        """
+        Return True if the trend filter should be enforced for the given timestamp.
+
+        Supported scopes:
+            - "always": enforce on every bar
+            - "window": enforce only inside the configured weekday and hour window
+        """
+        cfg = getattr(self, "trend_filter", {}) or {}
+        if not cfg.get("enabled", False):
+            return False
+
+        scope = str(cfg.get("scope", "always")).lower().strip()
+        if scope == "always":
+            return True
+        if scope in {"window", "time_window", "session"}:
+            return self._is_trend_filter_window_active(current_time)
+
+        return False
+
     def _is_signal_allowed(self, side, current_time, conditions_met, conditions_detail):
         """
-        Apply Thursday Asia overrides.
+        Apply optional trend filter rules.
 
-        On Thursday Asia:
-            SELL: min_conditions + 1 (4 of 5) AND must include a trend flag
-            BUY : min_conditions     (3 of 5) AND must include a trend flag
+        When the trend filter is active (configured via STRATEGY.trend_filter):
+            - Optionally requires at least one trend flag in conditions_detail.
+            - Can increase the minimum number of conditions required per side.
 
-        On all other days or sessions:
-            Behaves like the original logic:
+        When inactive, behaves like the original logic:
             conditions_met >= min_conditions with no mandatory trend flags.
         """
-        # Default behaviour for all other times
+        # Default behaviour
         min_required = self.min_conditions
         require_trend_flag = False
 
-        if self._is_thursday_asia(current_time):
-            if side == "SELL":
-                # Stricter SELL on Thursday Asia: 4 of 5 + trend alignment
-                min_required = self.min_conditions + 1
-                require_trend_flag = True
-            elif side == "BUY":
-                # BUY keeps normal count but must be trend aligned
-                require_trend_flag = True
+        cfg = getattr(self, "trend_filter", {}) or {}
+
+        # Optional trend filter behaviour
+        if self._is_trend_filter_active(current_time):
+            require_trend_flag = bool(cfg.get("require_trend_flag", True))
+
+            try:
+                buy_extra = int(cfg.get("buy_extra_conditions", 0) or 0)
+            except Exception:
+                buy_extra = 0
+            try:
+                sell_extra = int(cfg.get("sell_extra_conditions", 0) or 0)
+            except Exception:
+                sell_extra = 0
+
+            if side == "BUY":
+                min_required = self.min_conditions + max(0, buy_extra)
+            elif side == "SELL":
+                min_required = self.min_conditions + max(0, sell_extra)
 
         # Check count
         if conditions_met < min_required:
@@ -185,7 +251,7 @@ class FusionStrategy:
             current_bb_lower = bb_lower.iloc[-1]
             current_bb_middle = bb_middle.iloc[-1]
 
-            # Last bar time for Thursday Asia logic, if we have it
+            # Last bar time for optional trend filter window logic, if we have it
             current_time = None
             if "time" in df.columns:
                 current_time = df["time"].iloc[-1]
@@ -251,7 +317,7 @@ class FusionStrategy:
                     pass
 
             # Generate signal if conditions met
-            # Thursday Asia overrides are applied via _is_signal_allowed
+            # Optional trend filter rules are applied via _is_signal_allowed
 
             # Prefer BUY if both are allowed, same as your original priority
             if self._is_signal_allowed(
