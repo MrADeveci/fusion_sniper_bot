@@ -57,9 +57,6 @@ fusion_sniper_bot/
     telegram_command_handler.py
     watchdog_monitor.py
 
-  legacy/
-    daily_profit_manager.py
-    mt5_connector.py
 ```
 
 - `main_bot.py` . main Fusion Sniper trading bot
