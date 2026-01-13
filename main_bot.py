@@ -1,5 +1,5 @@
 """
-Fusion Sniper Bot - v4.1
+Fusion Sniper Bot - v4.3
 """
 
 import datetime as dt
