@@ -268,58 +268,63 @@ You would create one config per account or per symbol.
 
 ```json
 {
+  "_comment": "Fusion Sniper Trading Bot - v4.2",
+  
   "BROKER": {
+    "account": xxxxxxxx,
+    "password": "xxxxxxxxx",
+    "server": "ICMarketsSC-MT5-4",
     "symbol": "XAUUSD",
-    "magic_number": 234000,
-    "account": 0000001,
-    "password": "YOUR_MT5_PASSWORD",
-    "server": "YourBroker-Server",
-    "mt5_path": "C:\fs_demo_xauusd_0000001\MT5\terminal64.exe",
+    "magic_number": 000000,
+    "mt5_path": "C:\\fs_live_xauusd_11173822\\MT5\\terminal64.exe",
+    "timeout": 60000,
+    "portable": true,
     "broker_timezone_offset": 2
   },
-
+  
   "TRADING": {
     "timeframe": "M15",
     "lot_size": 0.7,
-    
+
     "_comment_positions": "Maximum Concurrent Positions",
     "max_positions": 2,
-    
+
     "_comment_stops": "Stop Loss & Take Profit Settings",
     "use_atr_based_stops": true,
-    "stop_loss_atr_multiple": 0.40,
+    "stop_loss_atr_multiple": 0.4,
     "take_profit_atr_multiple": 2.0,
-    
+
     "_comment_breakeven": "Smart Break-Even Settings",
     "use_smart_breakeven": true,
     "breakeven_profit_multiple": 0.6,
     "breakeven_lock_profit_multiple": 0.3,
-    
+
     "_comment_trailing": "Trailing Stop Settings",
     "use_trailing_stop": true,
     "trailing_stop_type": "chandelier",
     "trailing_stop_atr_multiple": 2.0,
     "min_profit_for_trail_activation": 1.8,
-    
+
     "_comment_cooldown": "Trade Cooldown Settings",
     "trade_cooldown_seconds": 60,
-    
+
     "_comment_profit": "Daily Profit Target",
-    "daily_profit_target": 127,
-    
+    "daily_profit_target": 55,
+
     "_comment_volatility": "Volatility Detection & Scalping",
     "volatility_detection": {
       "enabled": true,
       "atr_period": 14,
       "atr_scalp_threshold": 2.0,
-      "scalp_profit_target_gbp": 48.66,
+      "scalp_profit_target_gbp": 26.87,
       "scalp_cooldown_seconds": 30,
       "normal_cooldown_seconds": 60,
+
       "_comment_limits": "ATR based risk limits",
       "skip_trading_when_atr_extreme": true,
       "atr_max_for_trading": 20.0
     },
-    
+
     "_comment_orders": "Order Execution Settings",
     "order_execution": {
       "deviation": 10,
@@ -329,7 +334,7 @@ You would create one config per account or per symbol.
       "tolerance_pips": 2,
       "market_data_bars": 250
     },
-    
+
     "_comment_hours": "Trading Hours - UK time (Monday 01:00 - Friday 23:00, Sunday CLOSED)",
     "trading_hours": {
       "saturday_closed": true,
@@ -339,23 +344,23 @@ You would create one config per account or per symbol.
       "friday_close_hour": 23
     }
   },
-  
+
   "RISK": {
     "_comment_daily": "Daily loss protection in account currency",
     "max_risk_per_trade": 1.5,
-    "max_daily_loss": 210,
+    "max_daily_loss": 150,
     "max_daily_loss_currency": "GBP",
     "loss_limit_by_equity": true,
-    
+
     "_comment_weekly": "Weekly NET P&L caps in account currency. closed trades + swap - commission",
     "weekly_limits_enabled": true,
-    "max_weekly_profit": 350,
-    "max_weekly_loss": 411,
+    "max_weekly_profit": 150,
+    "max_weekly_loss": 175,
     "week_start_day": "monday",
-    
+
     "max_drawdown_percent": 10.0,
     "max_positions_per_bot": 2,
-    
+
     "_comment_confidence": "Confidence-Based Position Sizing",
     "confidence_based_scaling": {
       "enabled": false,
@@ -367,36 +372,36 @@ You would create one config per account or per symbol.
       }
     }
   },
-  
+
   "STRATEGY": {
     "_comment_ema": "EMA Settings",
     "ema_20_period": 20,
     "ema_50_period": 50,
     "ema_100_period": 100,
     "ema_200_period": 200,
-    
+
     "_comment_rsi": "RSI Settings",
     "rsi_period": 14,
     "rsi_oversold": 40,
     "rsi_overbought": 60,
-    
+
     "_comment_atr": "ATR Settings",
     "atr_period": 14,
     "atr_multiplier": 1.5,
-    
+
     "_comment_macd": "MACD Settings",
     "macd_fast_period": 12,
     "macd_slow_period": 26,
     "macd_signal_period": 9,
-    
+
     "_comment_bb": "Bollinger Bands Settings",
     "bb_period": 20,
     "bb_std_dev": 2,
-    
+
     "_comment_conditions": "Signal Generation - Minimum conditions required for trade entry",
-    "min_conditions_required": 3,
+    "min_conditions_required": 4,
     "debug_signals": false,
-    
+
     "_comment_technical": "Technical Analysis Parameters",
     "technical_analysis": {
       "swing_detection_threshold": 0.0015,
@@ -405,22 +410,32 @@ You would create one config per account or per symbol.
       "breakout_volume_threshold": 1.5,
       "support_resistance_tolerance": 0.0005,
       "min_distance_from_sr": 0.001
+    },
+
+    "_comment_trend": "Trend Filter Parameters",
+    "trend_filter": {
+      "enabled": true,
+      "scope": "window",
+      "window": { "weekday": 3, "start_hour": 0, "end_hour": 8 },
+      "require_trend_flag": true,
+      "buy_extra_conditions": 0,
+      "sell_extra_conditions": 1
     }
   },
-  
+
   "TELEGRAM": {
-    "bot_token": "******************",
-    "chat_id": "******************",
-    "authorized_user_ids": ["******************"],
+    "bot_token": "00000000000000000000000000000",
+    "chat_id": "00000000000000",
+    "authorized_user_ids": ["00000000000"],
     "enabled": true,
-    
+
     "_comment_api": "Telegram API Settings",
     "api_timeout_seconds": 10
   },
-  
+
   "TELEGRAM_HANDLER": {
     "_comment": "Telegram command handler settings",
-    
+
     "_comment_paths": "File Paths",
     "paths": {
       "log_file": "logs/telegram_handler.log",
@@ -430,16 +445,16 @@ You would create one config per account or per symbol.
       "news_events_file": "cache/news_events.json",
       "log_directory": "logs"
     },
-    
+
     "_comment_timeouts": "Timeouts and Intervals",
     "command_timeout_seconds": 30,
-    
+
     "_comment_intervals": "Check Intervals",
     "intervals": {
       "bot_startup_check": 1,
       "process_wait": 2
     },
-    
+
     "_comment_health": "Health Check Thresholds",
     "health_thresholds": {
       "log_active_minutes": 5,
@@ -447,14 +462,14 @@ You would create one config per account or per symbol.
       "margin_safe_level": 500,
       "margin_warning_level": 200
     },
-    
+
     "_comment_display": "Display Settings",
     "display": {
       "news_forecast_hours": 24,
       "max_news_events": 5
     }
   },
-  
+
   "NEWS_FILTER": {
     "enabled": true,
     "api_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
@@ -463,16 +478,16 @@ You would create one config per account or per symbol.
     "check_interval_seconds": 300,
     "impact_levels": ["High", "Holiday"],
     "monitored_currencies": ["USD"],
-  
+
     "_comment_notifications": "News Notification Settings",
     "notify_on_news_avoidance": true,
-  
+
     "_comment_weekly": "Weekly Planning Summary (Sunday before market open)",
     "weekly_summary_enabled": true,
     "weekly_summary_day": 6,
     "weekly_summary_hour_gmt": 22,
     "holiday_buffer_hours": 12,
-  
+
     "_comment_cache": "Cache Settings",
     "cache_directory": "cache",
     "cache_max_age_minutes": 10,
@@ -480,49 +495,51 @@ You would create one config per account or per symbol.
     "cache_validity_hours": 6,
     "cache_retention_days": 7,
     "api_timeout_seconds": 10,
-    
+
     "_comment_retry": "Retry Logic",
     "max_retries": 3,
     "retry_delay_seconds": 2
   },
-  
+
   "STATISTICS": {
     "enabled": true,
     "stats_file_path": "logs/trade_statistics_{symbol}.json",
     "max_history": 100,
-    
+
     "_comment_tracking": "What to Track",
     "track_mae": true,
     "track_mfe": true,
     "track_session_performance": true,
     "track_exit_reasons": true
   },
-  
+
   "WATCHDOG": {
     "_comment": "Watchdog monitor settings",
     "check_interval_seconds": 300,
 
     "_comment_hours": "Trading Hours - UK time (Monday 01:00 - Friday 23:00, Sunday CLOSED)",
     "trading_hours": {
-    "saturday_closed": true,
-    "sunday_closed": true,
-    "monday_open_hour": 1,
-    "sunday_open_hour": 23,
-    "friday_close_hour": 23
-},
-    
+      "saturday_closed": true,
+      "sunday_closed": true,
+      "monday_open_hour": 1,
+      "sunday_open_hour": 23,
+      "friday_close_hour": 23
+    },
+
     "_comment_cache": "Cache Retention",
     "cache_retention_hours": 168
   },
-  
+
   "SYSTEM": {
     "_comment": "System-wide settings",
     "_comment_paths": "File Paths",
     "log_directory": "logs",
     "bot_status_file": "logs/bot_status.json",
+
     "_comment_logging": "Logging Configuration",
     "log_format": "%(asctime)s - %(levelname)s - %(message)s",
     "log_retention_days": 7,
+
     "_comment_timing": "Loop Timing (seconds)",
     "main_loop_interval": 1,
     "paused_loop_interval": 300,
