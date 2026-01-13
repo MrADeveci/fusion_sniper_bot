@@ -1,5 +1,5 @@
 """
-Fusion Sniper Bot Strategy v4.2
+Fusion Sniper Bot Strategy v4.3
 Independent BUY/SELL condition evaluation
 """
 
@@ -57,28 +57,37 @@ class FusionStrategy:
             self.trend_filter = default_trend_filter
 
         # EMA parameters
-        self.ema_fast = self.strategy_config.get("ema_fast_period", 21)
-        self.ema_slow = self.strategy_config.get("ema_slow_period", 50)
-        self.ema_trend = self.strategy_config.get("ema_trend_period", 200)
+        # Supports both canonical keys and legacy keys from older configs.
+        def _pick(keys, default):
+            for k in keys:
+                if k in self.strategy_config:
+                    return self.strategy_config.get(k)
+            return default
+
+        self.ema_fast = int(_pick(["ema_fast_period", "ema_20_period"], 21))
+        self.ema_slow = int(_pick(["ema_slow_period", "ema_50_period"], 50))
+        self.ema_trend = int(_pick(["ema_trend_period", "ema_200_period"], 200))
 
         # RSI parameters
-        self.rsi_period = self.strategy_config.get("rsi_period", 14)
-        self.rsi_oversold = self.strategy_config.get("rsi_oversold", 30)
-        self.rsi_overbought = self.strategy_config.get("rsi_overbought", 70)
+        self.rsi_period = int(self.strategy_config.get("rsi_period", 14))
+        self.rsi_oversold = float(self.strategy_config.get("rsi_oversold", 30))
+        self.rsi_overbought = float(self.strategy_config.get("rsi_overbought", 70))
 
         # ADX parameters
-        self.adx_period = self.strategy_config.get("adx_period", 14)
-        self.adx_threshold = self.strategy_config.get("adx_threshold", 25)
+        self.adx_period = int(self.strategy_config.get("adx_period", 14))
+        self.adx_threshold = float(self.strategy_config.get("adx_threshold", 25))
 
         # Stochastic parameters
-        self.stoch_k = self.strategy_config.get("stochastic_k", 14)
-        self.stoch_d = self.strategy_config.get("stochastic_d", 3)
-        self.stoch_oversold = self.strategy_config.get("stochastic_oversold", 20)
-        self.stoch_overbought = self.strategy_config.get("stochastic_overbought", 80)
+        self.stoch_k = int(self.strategy_config.get("stochastic_k", 14))
+        self.stoch_d = int(self.strategy_config.get("stochastic_d", 3))
+        self.stoch_oversold = float(self.strategy_config.get("stochastic_oversold", 20))
+        self.stoch_overbought = float(self.strategy_config.get("stochastic_overbought", 80))
 
         # Bollinger Bands
-        self.bb_period = self.strategy_config.get("bollinger_period", 20)
-        self.bb_std = self.strategy_config.get("bollinger_std", 2)
+        # Supports both canonical keys and legacy keys from older configs.
+        self.bb_period = int(_pick(["bollinger_period", "bb_period"], 20))
+        self.bb_std = float(_pick(["bollinger_std", "bb_std_dev"], 2))
+
 
     # ------------------------------------------------------------------
     # Trend filter helpers
