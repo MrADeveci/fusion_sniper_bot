@@ -443,38 +443,42 @@ class FusionSniperBot:
 
         return True
     
+
     def calculate_atr(self):
-        """Calculate Average True Range"""
-        if not self.volatility_enabled:
-            period = 14
-        else:
-            period = self.atr_period
-        
+        """Calculate Average True Range (ATR).
+
+        Uses the configured ATR timeframe (defaults to TRADING.timeframe for backwards compatibility).
+        Uses only closed candles (skips the forming candle) to avoid unstable ATR values.
+        """
+        period = self.atr_period if self.volatility_enabled else 14
+
         try:
-            rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, period + 1)
-            
+            tf = getattr(self, 'atr_timeframe', self.timeframe)
+            # start_pos=1 skips the forming candle so ATR is stable
+            rates = mt5.copy_rates_from_pos(self.symbol, tf, 1, period + 1)
+
             if rates is None or len(rates) < period + 1:
                 return None
-            
+
             high = np.array([r['high'] for r in rates])
             low = np.array([r['low'] for r in rates])
             close = np.array([r['close'] for r in rates])
-            
+
             tr_list = []
             for i in range(1, len(rates)):
                 hl = high[i] - low[i]
-                hc = abs(high[i] - close[i-1])
-                lc = abs(low[i] - close[i-1])
+                hc = abs(high[i] - close[i - 1])
+                lc = abs(low[i] - close[i - 1])
                 tr = max(hl, hc, lc)
                 tr_list.append(tr)
-            
-            atr = np.mean(tr_list[-period:])
+
+            atr = float(np.mean(tr_list[-period:]))
             return atr
-            
+
         except Exception as e:
             self.logger.error(f"Error calculating ATR: {e}")
             return None
-    
+
     def update_trading_mode(self):
         """Update trading mode based on ATR"""
         if not self.volatility_enabled:
@@ -661,13 +665,29 @@ class FusionSniperBot:
             self.logger.error(f"Error checking swap avoidance window: {e}")
             return False, ""
     
-    def get_market_data(self, bars=100):
-        """Get market data"""
+
+    def get_market_data(self, bars=100, timeframe=None, closed_only=True):
+        """Get market data from MT5.
+
+        Args:
+            bars (int): number of bars to fetch
+            timeframe: MT5 timeframe constant. If None, uses self.timeframe
+            closed_only (bool): if True, skips the forming candle for stable indicators
+        """
         try:
-            rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 0, bars)
+            tf = timeframe if timeframe is not None else self.timeframe
+            start_pos = 1 if closed_only else 0
+            rates = mt5.copy_rates_from_pos(self.symbol, tf, start_pos, bars)
             if rates is None or len(rates) == 0:
                 return None
-                
+
+            # Normalise ordering to oldest -> newest just in case broker returns reversed
+            try:
+                if len(rates) >= 2 and rates[0]['time'] > rates[-1]['time']:
+                    rates = rates[::-1]
+            except Exception:
+                pass
+
             return rates
         except Exception as e:
             self.logger.error(f"Error getting market data: {e}")
@@ -1053,6 +1073,75 @@ class FusionSniperBot:
             return True, remaining
         
         return False, 0
+
+
+    def _is_position_at_breakeven_or_better(self, position):
+        """Return True if position stop-loss is at breakeven or locked profit.
+
+        For BUY: SL >= entry price (within a tiny tolerance)
+        For SELL: SL <= entry price (within a tiny tolerance)
+        """
+        try:
+            if position is None:
+                return False
+
+            # Prefer tracked flag (set when our breakeven logic modifies SL)
+            pos_data = self.tracked_positions.get(getattr(position, 'ticket', None))
+            if pos_data and pos_data.get('breakeven_applied', False):
+                return True
+
+            sl = getattr(position, 'sl', 0.0) or 0.0
+            if sl == 0.0:
+                return False
+
+            entry = float(getattr(position, 'price_open', 0.0) or 0.0)
+
+            info = mt5.symbol_info(self.symbol)
+            point = float(getattr(info, 'point', 0.0) or 0.0)
+            # Safety tolerance: 2 points allows for rounding differences
+            tol = point * 2 if point else 0.0
+
+            # MT5 position.type: 0=BUY, 1=SELL
+            if getattr(position, 'type', None) == 0:
+                return sl >= (entry - tol)
+            return sl <= (entry + tol)
+
+        except Exception:
+            return False
+
+    def can_open_new_position(self, positions):
+        """Gate new entries by max_positions, with a scalper-friendly rule.
+
+        Behaviour:
+            - If TRADING.max_positions <= 1, behaves exactly as before.
+            - If TRADING.max_positions >= 2, only allow the second position once the first is at breakeven or better.
+        """
+        try:
+            bot_positions = []
+            if positions:
+                bot_positions = [p for p in positions if getattr(p, 'magic', None) == self.magic_number]
+
+            count = len(bot_positions)
+
+            # Default behaviour: allow if we are below the configured max
+            if self.max_positions <= 1:
+                return count < self.max_positions
+
+            if count == 0:
+                return True
+
+            if count >= self.max_positions:
+                return False
+
+            # If we're about to open position #2, require the first to be risk-free.
+            if count == 1 and self.max_positions >= 2:
+                return self._is_position_at_breakeven_or_better(bot_positions[0])
+
+            return True
+
+        except Exception:
+            # Fail safe: do not open new trades if gating logic errors
+            return False
     
     def update_tracked_positions(self):
         """Update tracked positions"""
@@ -1561,7 +1650,7 @@ class FusionSniperBot:
                 
                 # Look for new trades. only when not paused by daily or weekly caps, news, swap window, or extreme ATR
                 if (
-                    position_count < self.max_positions
+                    self.can_open_new_position(positions)
                     and not daily_paused
                     and not weekly_paused
                     and not avoiding_news
