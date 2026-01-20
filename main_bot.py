@@ -62,7 +62,31 @@ class FusionSniperBot:
         # Bot state
         self.symbol = self.config['BROKER']['symbol']
         self.magic_number = self.config['BROKER']['magic_number']
-        self.timeframe = getattr(mt5, f"TIMEFRAME_{self.config['TRADING']['timeframe']}")
+
+        # Timeframes
+        # Backwards compatible: if entry/bias/atr timeframes are not provided, fall back to TRADING.timeframe
+        trading_cfg = self.config.get('TRADING', {})
+        base_tf = trading_cfg.get('timeframe', 'M15')
+        entry_tf = trading_cfg.get('entry_timeframe', base_tf)
+        bias_tf = trading_cfg.get('bias_timeframe', base_tf)
+        atr_tf = trading_cfg.get('atr_timeframe', bias_tf)
+
+        self.entry_timeframe_str = entry_tf
+        self.bias_timeframe_str = bias_tf
+        self.atr_timeframe_str = atr_tf
+
+        self.entry_timeframe = getattr(mt5, f"TIMEFRAME_{entry_tf}")
+        self.bias_timeframe = getattr(mt5, f"TIMEFRAME_{bias_tf}")
+        self.atr_timeframe = getattr(mt5, f"TIMEFRAME_{atr_tf}")
+
+        # Legacy attribute for existing code paths. In multi timeframe mode, this refers to the entry timeframe
+        self.timeframe = self.entry_timeframe
+
+        # Candle gating and bias caching
+        self.last_entry_bar_time = None
+        self.last_bias_bar_time = None
+        self.last_market_bias = None
+
         self.running = True
         
         # Trading parameters
@@ -442,20 +466,26 @@ class FusionSniperBot:
             return False
 
         return True
-    
 
-    def calculate_atr(self):
+
+    def calculate_atr(self, timeframe=None, closed_only=True):
         """Calculate Average True Range (ATR).
 
-        Uses the configured ATR timeframe (defaults to TRADING.timeframe for backwards compatibility).
-        Uses only closed candles (skips the forming candle) to avoid unstable ATR values.
+        timeframe: MT5 timeframe constant. Defaults to self.atr_timeframe if configured, otherwise self.timeframe.
+        closed_only: when True, excludes the currently forming candle.
         """
-        period = self.atr_period if self.volatility_enabled else 14
+        if not self.volatility_enabled:
+            period = 14
+        else:
+            period = self.atr_period
 
         try:
-            tf = getattr(self, 'atr_timeframe', self.timeframe)
-            # start_pos=1 skips the forming candle so ATR is stable
-            rates = mt5.copy_rates_from_pos(self.symbol, tf, 1, period + 1)
+            tf = timeframe
+            if tf is None:
+                tf = getattr(self, 'atr_timeframe', None) or self.timeframe
+
+            start_pos = 1 if closed_only else 0
+            rates = mt5.copy_rates_from_pos(self.symbol, tf, start_pos, period + 1)
 
             if rates is None or len(rates) < period + 1:
                 return None
@@ -483,31 +513,31 @@ class FusionSniperBot:
         """Update trading mode based on ATR"""
         if not self.volatility_enabled:
             return
-        
+
         try:
-            atr = self.calculate_atr()
+            atr = self.calculate_atr(timeframe=getattr(self, 'atr_timeframe', None), closed_only=True)
             if atr is None:
                 return
-            
+
             self.current_atr = atr
             previous_mode = self.current_mode
-            
+
             self.current_mode = 'scalp' if atr > self.atr_scalp_threshold else 'normal'
-            
+
             if previous_mode != self.current_mode:
+                self.logger.info("=" * 50)
                 if self.current_mode == 'scalp':
-                    self.logger.info("="*50)
                     self.logger.info(f"SWITCHED TO SCALPING MODE | ATR: {atr:.4f}")
-                    self.logger.info("="*50)
                 else:
-                    self.logger.info("="*50)
                     self.logger.info(f"SWITCHED TO NORMAL MODE | ATR: {atr:.4f}")
-                    self.logger.info("="*50)
-            
+                self.logger.info("=" * 50)
+
             self.last_atr_check = datetime.now()
-            
+
         except Exception as e:
             self.logger.error(f"Error updating trading mode: {e}")
+
+
     
     def check_quick_profit_exit(self, position):
         """Check quick profit exit in scalping mode"""
@@ -665,14 +695,11 @@ class FusionSniperBot:
             self.logger.error(f"Error checking swap avoidance window: {e}")
             return False, ""
     
-
     def get_market_data(self, bars=100, timeframe=None, closed_only=True):
         """Get market data from MT5.
 
-        Args:
-            bars (int): number of bars to fetch
-            timeframe: MT5 timeframe constant. If None, uses self.timeframe
-            closed_only (bool): if True, skips the forming candle for stable indicators
+        timeframe: MT5 timeframe constant. Defaults to self.timeframe.
+        closed_only: when True, excludes the currently forming candle.
         """
         try:
             tf = timeframe if timeframe is not None else self.timeframe
@@ -681,12 +708,9 @@ class FusionSniperBot:
             if rates is None or len(rates) == 0:
                 return None
 
-            # Normalise ordering to oldest -> newest just in case broker returns reversed
-            try:
-                if len(rates) >= 2 and rates[0]['time'] > rates[-1]['time']:
-                    rates = rates[::-1]
-            except Exception:
-                pass
+            # Normalise ordering to oldest -> newest, just in case
+            if len(rates) >= 2 and rates[0]['time'] > rates[-1]['time']:
+                rates = rates[::-1]
 
             return rates
         except Exception as e:
@@ -706,6 +730,77 @@ class FusionSniperBot:
             self.logger.debug(f"Position lookup failed. {e}")
         return False
     
+
+    def _get_bot_positions(self):
+        """Return a list of open positions for this bot (symbol + magic)."""
+        try:
+            positions = mt5.positions_get(symbol=self.symbol)
+            if not positions:
+                return []
+            return [p for p in positions if p.magic == self.magic_number]
+        except Exception as e:
+            self.logger.debug(f"Position lookup failed. {e}")
+            return []
+
+    def _position_side(self, position):
+        """Return 'BUY' or 'SELL' for an MT5 position."""
+        try:
+            return 'BUY' if int(position.type) == 0 else 'SELL'
+        except Exception:
+            return 'BUY'
+
+    def _is_position_risk_free(self, position):
+        """Return True when the position SL is at breakeven or better."""
+        try:
+            sl = float(getattr(position, 'sl', 0.0) or 0.0)
+            if sl == 0.0:
+                return False
+
+            entry = float(getattr(position, 'price_open', 0.0) or 0.0)
+            symbol_info = mt5.symbol_info(self.symbol)
+            point = symbol_info.point if symbol_info else 0.0
+            tol = (2.0 * point) if point else 0.0
+
+            if int(position.type) == 0:  # BUY
+                return sl >= (entry - tol)
+
+            # SELL
+            return sl <= (entry + tol)
+
+        except Exception:
+            return False
+
+    def _can_open_new_position(self, new_side):
+        """Position stacking rule.
+
+        - If no open positions, allow.
+        - If one open position and max_positions >= 2, only allow a second entry when:
+            - The existing position is risk free (SL at breakeven or better)
+            - The new signal is the same direction as the existing position
+        - Otherwise, block.
+        """
+        try:
+            positions = self._get_bot_positions()
+            count = len(positions)
+
+            if count == 0:
+                return True
+
+            if count >= self.max_positions:
+                return False
+
+            if count == 1 and self.max_positions >= 2:
+                first = positions[0]
+                first_side = self._position_side(first)
+                if str(new_side).upper() != first_side:
+                    return False
+                return self._is_position_risk_free(first)
+
+            return False
+
+        except Exception:
+            return False
+
     def check_daily_profit(self):
         """Check daily profit and update pause status. TIMEZONE AWARE + SWAP INCLUDED with pending loss and profit behaviour"""
         try:
@@ -1073,75 +1168,6 @@ class FusionSniperBot:
             return True, remaining
         
         return False, 0
-
-
-    def _is_position_at_breakeven_or_better(self, position):
-        """Return True if position stop-loss is at breakeven or locked profit.
-
-        For BUY: SL >= entry price (within a tiny tolerance)
-        For SELL: SL <= entry price (within a tiny tolerance)
-        """
-        try:
-            if position is None:
-                return False
-
-            # Prefer tracked flag (set when our breakeven logic modifies SL)
-            pos_data = self.tracked_positions.get(getattr(position, 'ticket', None))
-            if pos_data and pos_data.get('breakeven_applied', False):
-                return True
-
-            sl = getattr(position, 'sl', 0.0) or 0.0
-            if sl == 0.0:
-                return False
-
-            entry = float(getattr(position, 'price_open', 0.0) or 0.0)
-
-            info = mt5.symbol_info(self.symbol)
-            point = float(getattr(info, 'point', 0.0) or 0.0)
-            # Safety tolerance: 2 points allows for rounding differences
-            tol = point * 2 if point else 0.0
-
-            # MT5 position.type: 0=BUY, 1=SELL
-            if getattr(position, 'type', None) == 0:
-                return sl >= (entry - tol)
-            return sl <= (entry + tol)
-
-        except Exception:
-            return False
-
-    def can_open_new_position(self, positions):
-        """Gate new entries by max_positions, with a scalper-friendly rule.
-
-        Behaviour:
-            - If TRADING.max_positions <= 1, behaves exactly as before.
-            - If TRADING.max_positions >= 2, only allow the second position once the first is at breakeven or better.
-        """
-        try:
-            bot_positions = []
-            if positions:
-                bot_positions = [p for p in positions if getattr(p, 'magic', None) == self.magic_number]
-
-            count = len(bot_positions)
-
-            # Default behaviour: allow if we are below the configured max
-            if self.max_positions <= 1:
-                return count < self.max_positions
-
-            if count == 0:
-                return True
-
-            if count >= self.max_positions:
-                return False
-
-            # If we're about to open position #2, require the first to be risk-free.
-            if count == 1 and self.max_positions >= 2:
-                return self._is_position_at_breakeven_or_better(bot_positions[0])
-
-            return True
-
-        except Exception:
-            # Fail safe: do not open new trades if gating logic errors
-            return False
     
     def update_tracked_positions(self):
         """Update tracked positions"""
@@ -1162,7 +1188,7 @@ class FusionSniperBot:
             
             for position in current_positions:
                 if position.ticket not in self.tracked_positions:
-                    entry_atr = self.calculate_atr()
+                    entry_atr = self.calculate_atr(timeframe=getattr(self, 'atr_timeframe', None), closed_only=True)
                     if entry_atr is None:
                         entry_atr = 0
                     
@@ -1287,7 +1313,7 @@ class FusionSniperBot:
             price = tick.ask if order_type == 'BUY' else tick.bid
             
             # Get current ATR for this trade
-            current_atr = self.calculate_atr()
+            current_atr = self.calculate_atr(timeframe=getattr(self, 'atr_timeframe', None), closed_only=True)
             if current_atr is None:
                 self.logger.warning("Cannot calculate ATR, skipping trade")
                 return False
@@ -1428,7 +1454,7 @@ class FusionSniperBot:
                 entry_atr = pos_data.get('entry_atr', 0)
                 
                 if entry_atr == 0:
-                    entry_atr = self.calculate_atr()
+                    entry_atr = self.calculate_atr(timeframe=getattr(self, 'atr_timeframe', None), closed_only=True)
                     if entry_atr:
                         pos_data['entry_atr'] = entry_atr
                 
@@ -1650,7 +1676,7 @@ class FusionSniperBot:
                 
                 # Look for new trades. only when not paused by daily or weekly caps, news, swap window, or extreme ATR
                 if (
-                    self.can_open_new_position(positions)
+                    position_count < self.max_positions
                     and not daily_paused
                     and not weekly_paused
                     and not avoiding_news
@@ -1666,14 +1692,55 @@ class FusionSniperBot:
                             # Read market_data_bars from config
                             order_execution = self.config['TRADING'].get('order_execution', {})
                             bars_to_fetch = order_execution.get('market_data_bars', 100)
-                            rates = self.get_market_data(bars=bars_to_fetch)
-                            
-                            if rates is not None:
-                                signal = self.strategy.analyze_from_rates(rates)
-                                
-                                if signal:
-                                    self.logger.info(f"Trade signal: {signal['type']}")
-                                    self.open_trade(signal)
+
+                            # Gate evaluation to once per closed entry candle
+                            entry_rates = self.get_market_data(
+                                bars=bars_to_fetch,
+                                timeframe=getattr(self, 'entry_timeframe', None) or self.timeframe,
+                                closed_only=True,
+                            )
+
+                            if entry_rates is None:
+                                continue
+
+                            entry_bar_time = entry_rates[-1]['time']
+                            if self.last_entry_bar_time == entry_bar_time:
+                                continue
+
+                            self.last_entry_bar_time = entry_bar_time
+
+                            # Update bias on the higher timeframe (strict direction filter)
+                            bias_rates = self.get_market_data(
+                                bars=max(250, bars_to_fetch),
+                                timeframe=getattr(self, 'bias_timeframe', None) or self.timeframe,
+                                closed_only=True,
+                            )
+
+                            if bias_rates is not None:
+                                bias_bar_time = bias_rates[-1]['time']
+                                if self.last_bias_bar_time != bias_bar_time or self.last_market_bias is None:
+                                    self.last_bias_bar_time = bias_bar_time
+                                    try:
+                                        self.last_market_bias = self.strategy.get_bias_from_rates(bias_rates)
+                                    except Exception:
+                                        self.last_market_bias = None
+
+                            bias = self.last_market_bias or 'NEUTRAL'
+
+                            signal = self.strategy.analyze_from_rates(entry_rates, bias=bias)
+
+                            if signal:
+                                # Allow stacking only when the first position is risk free
+                                if not self._can_open_new_position(signal['type']):
+                                    self.logger.info(
+                                        f"Signal {signal['type']} skipped. stacking rule not satisfied"
+                                    )
+                                    continue
+
+                                self.logger.info(
+                                    f"Trade signal: {signal['type']} | bias={bias} | cond={signal.get('conditions_met', 0)}"
+                                )
+                                self.open_trade(signal)
                 
                 # Faster loop while trading. slower loop when paused for the day
                 sleep_interval = self.paused_loop_interval if target_reached else self.main_loop_interval

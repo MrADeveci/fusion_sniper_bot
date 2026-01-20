@@ -38,7 +38,7 @@ class FusionStrategy:
             },
             "require_trend_flag": True,
             "buy_extra_conditions": 0,
-            "sell_extra_conditions": 1,
+            "sell_extra_conditions": 0,
         }
 
         user_trend_filter = self.strategy_config.get("trend_filter", None)
@@ -191,7 +191,58 @@ class FusionStrategy:
 
         return True
 
-    def analyze_from_rates(self, rates):
+
+    # ------------------------------------------------------------------
+    # Multi timeframe bias helpers
+    # ------------------------------------------------------------------
+    def get_bias_from_rates(self, rates):
+        """Return market bias from raw MT5 rates.
+
+        Bias rules:
+        - BULL: EMA fast > EMA slow and close > EMA trend
+        - BEAR: EMA fast < EMA slow and close < EMA trend
+        - NEUTRAL: otherwise
+        """
+        if rates is None:
+            return "NEUTRAL"
+
+        df = pd.DataFrame(rates)
+        if df.empty or len(df) < max(self.ema_trend, self.ema_slow, self.ema_fast) + 5:
+            return "NEUTRAL"
+
+        if "time" in df.columns:
+            try:
+                df["time"] = pd.to_datetime(df["time"], unit="s")
+            except Exception:
+                pass
+
+        return self.get_bias(df)
+
+    def get_bias(self, data):
+        """Return market bias from a DataFrame with OHLC columns."""
+        try:
+            if data is None or len(data) < max(self.ema_trend, self.ema_slow, self.ema_fast) + 5:
+                return "NEUTRAL"
+
+            df = data.copy()
+            ema_fast = EMAIndicator(close=df["close"], window=self.ema_fast).ema_indicator()
+            ema_slow = EMAIndicator(close=df["close"], window=self.ema_slow).ema_indicator()
+            ema_trend = EMAIndicator(close=df["close"], window=self.ema_trend).ema_indicator()
+
+            current_price = float(df["close"].iloc[-1])
+            current_ema_fast = float(ema_fast.iloc[-1])
+            current_ema_slow = float(ema_slow.iloc[-1])
+            current_ema_trend = float(ema_trend.iloc[-1])
+
+            if current_ema_fast > current_ema_slow and current_price > current_ema_trend:
+                return "BULL"
+            if current_ema_fast < current_ema_slow and current_price < current_ema_trend:
+                return "BEAR"
+            return "NEUTRAL"
+        except Exception:
+            return "NEUTRAL"
+
+    def analyze_from_rates(self, rates, bias=None):
         """Takes raw MT5 rates, builds DataFrame, then runs main analyze logic"""
         if rates is None or len(rates) < 200:
             return None
@@ -200,9 +251,9 @@ class FusionStrategy:
         if "time" in df.columns:
             df["time"] = pd.to_datetime(df["time"], unit="s")
 
-        return self.analyze(df)
+        return self.analyze(df, bias=bias)
 
-    def analyze(self, data):
+    def analyze(self, data, bias=None):
         """Analyze market data and return signal"""
         try:
             if data is None or len(data) < 200:
@@ -267,104 +318,114 @@ class FusionStrategy:
             if "time" in df.columns:
                 current_time = df["time"].iloc[-1]
 
+            # Multi timeframe strict bias gating when a bias is provided
+            bias_norm = None
+            if bias is not None:
+                bias_norm = str(bias).upper().strip()
+                if bias_norm == "NEUTRAL":
+                    return None
 
-            # BUY and SELL conditions
-            # This deliberately uses more 'trigger' style conditions so the bot can take more scalps,
-            # while the multi-timeframe bias (passed in via 'bias') keeps it directionally disciplined.
+            allow_buy = True
+            allow_sell = True
+            if bias_norm == "BULL":
+                allow_sell = False
+            elif bias_norm == "BEAR":
+                allow_buy = False
 
+            # Use prior values for cross and reclaim checks
+            prev_close = float(df["close"].iloc[-2])
+            prev_rsi = float(rsi.iloc[-2])
+            prev_stoch_k = float(stoch_k.iloc[-2])
+            prev_stoch_d = float(stoch_d.iloc[-2])
+            prev_bb_middle = float(bb_middle.iloc[-2])
+
+            # Conditions per side
             total_conditions = 7
+            rsi_mid = float((self.rsi_overbought + self.rsi_oversold) / 2.0)
 
+            # BUY conditions (independent evaluation)
             buy_conditions = 0
             buy_details = []
 
+            if current_ema_fast > current_ema_slow:
+                buy_conditions += 1
+                buy_details.append("EMA_CROSS")
+
+            if current_price > current_ema_trend:
+                buy_conditions += 1
+                buy_details.append("ABOVE_TREND")
+
+            if current_adx > self.adx_threshold:
+                buy_conditions += 1
+                buy_details.append("STRONG_TREND")
+
+            # Pullback / recovery in RSI. more active than strict oversold only
+            if current_rsi <= rsi_mid or (current_rsi > prev_rsi and prev_rsi <= rsi_mid):
+                buy_conditions += 1
+                buy_details.append("RSI_PULLBACK")
+
+            # Stoch cross up or oversold reversal
+            if (prev_stoch_k <= prev_stoch_d and current_stoch_k > current_stoch_d) or (
+                current_stoch_k < self.stoch_oversold and current_stoch_k > current_stoch_d
+            ):
+                buy_conditions += 1
+                buy_details.append("STOCH_TRIGGER")
+
+            # Bollinger mid reclaim
+            if prev_close <= prev_bb_middle and current_price > current_bb_middle:
+                buy_conditions += 1
+                buy_details.append("BB_MID_RECLAIM")
+
+            # Recent lower band touch. pullback context
+            try:
+                recent = 5
+                if (df["close"].iloc[-recent:] <= bb_lower.iloc[-recent:]).any():
+                    buy_conditions += 1
+                    buy_details.append("BB_LOWER_TOUCH")
+            except Exception:
+                pass
+
+            # SELL conditions (independent evaluation)
             sell_conditions = 0
             sell_details = []
 
-            # Strict bias filter: only trade in the bias direction
-            bias = (bias or 'NEUTRAL').upper().strip()
-            allow_buy = bias == 'BULL'
-            allow_sell = bias == 'BEAR'
-
-            # Previous values for trigger logic
-            prev_price = df['close'].iloc[-2]
-            prev_ema_fast = ema_fast.iloc[-2]
-            prev_rsi = rsi.iloc[-2]
-            prev_stoch_k = stoch_k.iloc[-2]
-            prev_stoch_d = stoch_d.iloc[-2]
-            prev_bb_middle = bb_middle.iloc[-2]
-
-            # Recent band touches (use previous 3 closed candles for stability)
-            lookback = 3
-            recent_lows = df['low'].iloc[-(lookback + 1):-1]
-            recent_highs = df['high'].iloc[-(lookback + 1):-1]
-            recent_bb_lower = bb_lower.iloc[-(lookback + 1):-1]
-            recent_bb_upper = bb_upper.iloc[-(lookback + 1):-1]
-
-            touched_lower_band = any(l <= bl for l, bl in zip(recent_lows, recent_bb_lower))
-            touched_upper_band = any(h >= bu for h, bu in zip(recent_highs, recent_bb_upper))
-
-            # 1) EMA structure (trend direction)
-            if current_ema_fast > current_ema_slow:
-                buy_conditions += 1
-                buy_details.append('EMA_TREND')
             if current_ema_fast < current_ema_slow:
                 sell_conditions += 1
-                sell_details.append('EMA_TREND')
+                sell_details.append("EMA_CROSS")
 
-            # 2) Trend anchor (200 EMA)
-            if current_price > current_ema_trend:
-                buy_conditions += 1
-                buy_details.append('ABOVE_TREND')
             if current_price < current_ema_trend:
                 sell_conditions += 1
-                sell_details.append('BELOW_TREND')
+                sell_details.append("BELOW_TREND")
 
-            # 3) Momentum / regime proxy
             if current_adx > self.adx_threshold:
-                buy_conditions += 1
-                buy_details.append('STRONG_TREND')
                 sell_conditions += 1
-                sell_details.append('STRONG_TREND')
+                sell_details.append("STRONG_TREND")
 
-            # 4) RSI pullback recovery / rollover (more frequent than strict oversold/overbought)
-            if prev_rsi < 50 and current_rsi > prev_rsi and current_rsi >= 45:
-                buy_conditions += 1
-                buy_details.append('RSI_RECOVERY')
-            if prev_rsi > 50 and current_rsi < prev_rsi and current_rsi <= 55:
+            # Pullback / rollover in RSI
+            if current_rsi >= rsi_mid or (current_rsi < prev_rsi and prev_rsi >= rsi_mid):
                 sell_conditions += 1
-                sell_details.append('RSI_ROLLOVER')
+                sell_details.append("RSI_PULLBACK")
 
-            # 5) Stoch cross trigger
-            if prev_stoch_k <= prev_stoch_d and current_stoch_k > current_stoch_d and current_stoch_k < 60:
-                buy_conditions += 1
-                buy_details.append('STOCH_CROSS_UP')
-            if prev_stoch_k >= prev_stoch_d and current_stoch_k < current_stoch_d and current_stoch_k > 40:
+            # Stoch cross down or overbought reversal
+            if (prev_stoch_k >= prev_stoch_d and current_stoch_k < current_stoch_d) or (
+                current_stoch_k > self.stoch_overbought and current_stoch_k < current_stoch_d
+            ):
                 sell_conditions += 1
-                sell_details.append('STOCH_CROSS_DN')
+                sell_details.append("STOCH_TRIGGER")
 
-            # 6) Bollinger middle band reclaim
-            if prev_price <= prev_bb_middle and current_price > current_bb_middle:
-                buy_conditions += 1
-                buy_details.append('BB_RECLAIM')
-            if prev_price >= prev_bb_middle and current_price < current_bb_middle:
+            # Bollinger mid rejection
+            if prev_close >= prev_bb_middle and current_price < current_bb_middle:
                 sell_conditions += 1
-                sell_details.append('BB_RECLAIM')
+                sell_details.append("BB_MID_REJECT")
 
-            # 7) Band touch in last few candles (pullback context)
-            if touched_lower_band:
-                buy_conditions += 1
-                buy_details.append('BB_LOWER_TOUCH')
-            if touched_upper_band:
-                sell_conditions += 1
-                sell_details.append('BB_UPPER_TOUCH')
-
-            # Apply strict bias gating after building conditions so debug output is useful
-            if not allow_buy:
-                buy_conditions = 0
-                buy_details = []
-            if not allow_sell:
-                sell_conditions = 0
-                sell_details = []
+            # Recent upper band touch. pullback context
+            try:
+                recent = 5
+                if (df["close"].iloc[-recent:] >= bb_upper.iloc[-recent:]).any():
+                    sell_conditions += 1
+                    sell_details.append("BB_UPPER_TOUCH")
+            except Exception:
+                pass
 
             # Optional debug output for signal evaluation
             if self.debug_signals:
@@ -382,7 +443,7 @@ class FusionStrategy:
             # Optional trend filter rules are applied via _is_signal_allowed
 
             # Prefer BUY if both are allowed, same as your original priority
-            if self._is_signal_allowed(
+            if allow_buy and self._is_signal_allowed(
                 side="BUY",
                 current_time=current_time,
                 conditions_met=buy_conditions,
@@ -395,7 +456,7 @@ class FusionStrategy:
                     "conditions_detail": buy_details,
                 }
 
-            if self._is_signal_allowed(
+            if allow_sell and self._is_signal_allowed(
                 side="SELL",
                 current_time=current_time,
                 conditions_met=sell_conditions,
