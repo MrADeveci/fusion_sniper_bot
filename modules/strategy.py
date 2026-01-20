@@ -267,60 +267,111 @@ class FusionStrategy:
             if "time" in df.columns:
                 current_time = df["time"].iloc[-1]
 
-            # BUY conditions (independent evaluation)
+
+            # BUY and SELL conditions
+            # This deliberately uses more 'trigger' style conditions so the bot can take more scalps,
+            # while the multi-timeframe bias (passed in via 'bias') keeps it directionally disciplined.
+
+            total_conditions = 7
+
             buy_conditions = 0
             buy_details = []
 
-            if current_ema_fast > current_ema_slow:
-                buy_conditions += 1
-                buy_details.append("EMA_CROSS")
-
-            if current_price > current_ema_trend:
-                buy_conditions += 1
-                buy_details.append("ABOVE_TREND")
-
-            if current_rsi < self.rsi_oversold:
-                buy_conditions += 1
-                buy_details.append("RSI_OVERSOLD")
-
-            if current_adx > self.adx_threshold:
-                buy_conditions += 1
-                buy_details.append("STRONG_TREND")
-
-            if current_stoch_k < self.stoch_oversold and current_stoch_k > current_stoch_d:
-                buy_conditions += 1
-                buy_details.append("STOCH_BULLISH")
-
-            # SELL conditions (independent evaluation)
             sell_conditions = 0
             sell_details = []
 
+            # Strict bias filter: only trade in the bias direction
+            bias = (bias or 'NEUTRAL').upper().strip()
+            allow_buy = bias == 'BULL'
+            allow_sell = bias == 'BEAR'
+
+            # Previous values for trigger logic
+            prev_price = df['close'].iloc[-2]
+            prev_ema_fast = ema_fast.iloc[-2]
+            prev_rsi = rsi.iloc[-2]
+            prev_stoch_k = stoch_k.iloc[-2]
+            prev_stoch_d = stoch_d.iloc[-2]
+            prev_bb_middle = bb_middle.iloc[-2]
+
+            # Recent band touches (use previous 3 closed candles for stability)
+            lookback = 3
+            recent_lows = df['low'].iloc[-(lookback + 1):-1]
+            recent_highs = df['high'].iloc[-(lookback + 1):-1]
+            recent_bb_lower = bb_lower.iloc[-(lookback + 1):-1]
+            recent_bb_upper = bb_upper.iloc[-(lookback + 1):-1]
+
+            touched_lower_band = any(l <= bl for l, bl in zip(recent_lows, recent_bb_lower))
+            touched_upper_band = any(h >= bu for h, bu in zip(recent_highs, recent_bb_upper))
+
+            # 1) EMA structure (trend direction)
+            if current_ema_fast > current_ema_slow:
+                buy_conditions += 1
+                buy_details.append('EMA_TREND')
             if current_ema_fast < current_ema_slow:
                 sell_conditions += 1
-                sell_details.append("EMA_CROSS")
+                sell_details.append('EMA_TREND')
 
+            # 2) Trend anchor (200 EMA)
+            if current_price > current_ema_trend:
+                buy_conditions += 1
+                buy_details.append('ABOVE_TREND')
             if current_price < current_ema_trend:
                 sell_conditions += 1
-                sell_details.append("BELOW_TREND")
+                sell_details.append('BELOW_TREND')
 
-            if current_rsi > self.rsi_overbought:
-                sell_conditions += 1
-                sell_details.append("RSI_OVERBOUGHT")
-
+            # 3) Momentum / regime proxy
             if current_adx > self.adx_threshold:
+                buy_conditions += 1
+                buy_details.append('STRONG_TREND')
                 sell_conditions += 1
-                sell_details.append("STRONG_TREND")
+                sell_details.append('STRONG_TREND')
 
-            if current_stoch_k > self.stoch_overbought and current_stoch_k < current_stoch_d:
+            # 4) RSI pullback recovery / rollover (more frequent than strict oversold/overbought)
+            if prev_rsi < 50 and current_rsi > prev_rsi and current_rsi >= 45:
+                buy_conditions += 1
+                buy_details.append('RSI_RECOVERY')
+            if prev_rsi > 50 and current_rsi < prev_rsi and current_rsi <= 55:
                 sell_conditions += 1
-                sell_details.append("STOCH_BEARISH")
+                sell_details.append('RSI_ROLLOVER')
+
+            # 5) Stoch cross trigger
+            if prev_stoch_k <= prev_stoch_d and current_stoch_k > current_stoch_d and current_stoch_k < 60:
+                buy_conditions += 1
+                buy_details.append('STOCH_CROSS_UP')
+            if prev_stoch_k >= prev_stoch_d and current_stoch_k < current_stoch_d and current_stoch_k > 40:
+                sell_conditions += 1
+                sell_details.append('STOCH_CROSS_DN')
+
+            # 6) Bollinger middle band reclaim
+            if prev_price <= prev_bb_middle and current_price > current_bb_middle:
+                buy_conditions += 1
+                buy_details.append('BB_RECLAIM')
+            if prev_price >= prev_bb_middle and current_price < current_bb_middle:
+                sell_conditions += 1
+                sell_details.append('BB_RECLAIM')
+
+            # 7) Band touch in last few candles (pullback context)
+            if touched_lower_band:
+                buy_conditions += 1
+                buy_details.append('BB_LOWER_TOUCH')
+            if touched_upper_band:
+                sell_conditions += 1
+                sell_details.append('BB_UPPER_TOUCH')
+
+            # Apply strict bias gating after building conditions so debug output is useful
+            if not allow_buy:
+                buy_conditions = 0
+                buy_details = []
+            if not allow_sell:
+                sell_conditions = 0
+                sell_details = []
 
             # Optional debug output for signal evaluation
             if self.debug_signals:
                 try:
                     print(
-                        f"[DEBUG] BUY {buy_conditions}/5 {buy_details} | "
-                        f"SELL {sell_conditions}/5 {sell_details} | "
+                        f"[DEBUG] BUY {buy_conditions}/{total_conditions} {buy_details} | "
+                        f"SELL {sell_conditions}/{total_conditions} {sell_details} | "
                         f"price={current_price:.2f} RSI={current_rsi:.1f} ADX={current_adx:.1f}"
                     )
                 except Exception:
@@ -339,7 +390,7 @@ class FusionStrategy:
             ):
                 return {
                     "type": "BUY",
-                    "confidence": buy_conditions / 5.0,
+                    "confidence": buy_conditions / float(total_conditions),
                     "conditions_met": buy_conditions,
                     "conditions_detail": buy_details,
                 }
@@ -352,7 +403,7 @@ class FusionStrategy:
             ):
                 return {
                     "type": "SELL",
-                    "confidence": sell_conditions / 5.0,
+                    "confidence": sell_conditions / float(total_conditions),
                     "conditions_met": sell_conditions,
                     "conditions_detail": sell_details,
                 }
