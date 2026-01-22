@@ -157,8 +157,11 @@ class FusionSniperBot:
 
         # Loop timing from config
         system_cfg = self.config.get('SYSTEM', {})
-        self.main_loop_interval = system_cfg.get('main_loop_interval', 10)
-        self.paused_loop_interval = system_cfg.get('paused_loop_interval', 30)
+        # main_loop_interval controls how often the bot runs when flat (scanning for entries)
+        # active_loop_interval controls how often the bot runs when there is at least one open position
+        self.main_loop_interval = int(system_cfg.get('main_loop_interval', 10))
+        self.active_loop_interval = int(system_cfg.get('active_loop_interval', self.main_loop_interval))
+        self.paused_loop_interval = int(system_cfg.get('paused_loop_interval', 30))
 
         
         # VOLATILITY DETECTION
@@ -1718,8 +1721,11 @@ class FusionSniperBot:
                                 self.logger.info(f"Trade signal: {signal['type']} | bias={self.last_market_bias}")
                                 self.open_trade(signal)
                 
-                # Faster loop while trading. slower loop when paused for the day
-                sleep_interval = self.paused_loop_interval if target_reached else self.main_loop_interval
+                # Loop cadence. slow down when paused for the day. run faster when managing open positions
+                if target_reached:
+                    sleep_interval = self.paused_loop_interval
+                else:
+                    sleep_interval = self.active_loop_interval if position_count > 0 else self.main_loop_interval
                 time.sleep(sleep_interval)
         
         except KeyboardInterrupt:
