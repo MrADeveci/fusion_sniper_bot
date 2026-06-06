@@ -1,5 +1,5 @@
 """
-Watchdog Monitor - Fusion Sniper Trading Bot
+Watchdog Monitor - Fusion Sniper Trading Bot v5.0.0
 Monitors bot health and restarts if necessary
 """
 
@@ -201,66 +201,69 @@ class WatchdogMonitor:
         print(f"Monitoring: {self.config['BROKER']['symbol']}")
         print("Press Ctrl+C to stop\n")
         
-        try:
-            while True:
+        # v5.0.0 (C2): the loop body is wrapped so a transient error logs and CONTINUES
+        # instead of killing the watchdog. KeyboardInterrupt still exits cleanly.
+        while True:
+            try:
                 # Check if within trading hours
                 if not self.is_within_trading_hours():
                     print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Outside trading hours, sleeping...")
                     time.sleep(self.check_interval)
                     continue
-                
+
                 # Check for manual stop flag
                 if self.check_manual_stop_flag():
                     print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Manual stop flag detected, not restarting")
                     time.sleep(self.check_interval)
                     continue
-                
-                # FIXED: Grace period during startup to prevent duplicate launches
+
+                # Grace period during startup to prevent duplicate launches
                 time_since_startup = time.time() - self.startup_time
                 if time_since_startup < self.startup_grace_period:
                     remaining = int(self.startup_grace_period - time_since_startup)
                     print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Startup grace period ({remaining}s remaining)...")
                     time.sleep(10)
                     continue
-                
+
                 # Check if bot is running
                 bot_running = self.is_bot_running()
                 bot_recently_started = self.is_bot_recently_started()
-                
+
                 if not bot_running:
-                    # FIXED: Don't restart if bot just started (another instance may be launching)
+                    # Don't restart if bot just started (another instance may be launching)
                     if bot_recently_started:
                         print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Bot recently started, waiting for confirmation...")
                         time.sleep(10)
                         continue
-                    
-                    # Only restart if bot was previously running (actual crash)
-                    if self.last_bot_running:
-                        print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Bot crashed, restarting...")
-                        if self.start_bot():
-                            # Wait for bot to start
-                            time.sleep(10)
-                            if self.is_bot_running():
-                                print("Bot confirmed running")
-                                self.last_bot_running = True
-                            else:
-                                print("Warning: Bot may not have started successfully")
-                    else:
-                        print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Bot not running (manual start expected)")
-                        self.last_bot_running = False
+
+                    # v5.0.0 (C2): restart whenever the bot is not running and no manual
+                    # stop flag is present -- INCLUDING a cold start where we never saw it
+                    # running. (Previously gated on self.last_bot_running, which meant a
+                    # bot down at watchdog start was never relaunched.)
+                    print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Bot not running, starting...")
+                    if self.start_bot():
+                        time.sleep(10)
+                        if self.is_bot_running():
+                            print("Bot confirmed running")
+                            self.last_bot_running = True
+                        else:
+                            print("Warning: Bot may not have started successfully")
                 else:
                     print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Bot is running")
                     self.last_bot_running = True
-                
+
                 # Cleanup old cache files
                 self.cleanup_old_cache()
-                
+
                 time.sleep(self.check_interval)
-        
-        except KeyboardInterrupt:
-            print("\nWatchdog stopped by user")
-        except Exception as e:
-            print(f"Watchdog error: {e}")
+
+            except KeyboardInterrupt:
+                print("\nWatchdog stopped by user")
+                break
+            except Exception as e:
+                # Log and keep monitoring rather than exiting the watchdog.
+                print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Watchdog loop error (continuing): {e}")
+                time.sleep(self.check_interval)
 
 def main():
     """Entry point"""
