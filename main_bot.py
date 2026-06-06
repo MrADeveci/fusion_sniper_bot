@@ -1,5 +1,5 @@
 """
-Fusion Sniper Bot - v4.4
+Fusion Sniper Bot - v5.0.0
 """
 
 import datetime as dt
@@ -11,6 +11,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
 import MetaTrader5 as mt5
 import numpy as np
@@ -27,13 +28,17 @@ from modules.trade_statistics import TradeStatistics
 class FusionSniperBot:
     """Main trading bot class with ATR-based position management"""
     
-    def __init__(self, config_file):
+    def __init__(self, config_file, paper_mode=False):
         """Initialize bot with configuration"""
         self.config_file = config_file
         self.config = self.load_config(config_file)
-        
+
         # Validate config before proceeding
         self.validate_config()
+
+        # v5.0.0: PAPER (dry-run) mode. On when SYSTEM.paper_mode is true OR --paper given.
+        self.paper_mode = bool(paper_mode or self.config.get('SYSTEM', {}).get('paper_mode', False))
+        self._paper_ticket_seq = 90000000  # simulated ticket counter
         
         # Setup logging first
         self.setup_logging()
@@ -99,7 +104,7 @@ class FusionSniperBot:
         self.max_positions = self.config['TRADING'].get('max_positions', 1)
         self.use_atr_stops = self.config['TRADING'].get('use_atr_based_stops', True)
         
-        # V3.0: ATR-based break-even and trailing stop
+        # v5.0.0: ATR-based break-even and trailing stop
         self.use_trailing_stop = self.config['TRADING'].get('use_trailing_stop', True)
         self.trailing_stop_type = self.config['TRADING'].get('trailing_stop_type', 'chandelier')
         self.trailing_atr_multiple = self.config['TRADING'].get('trailing_stop_atr_multiple', 2.0)
@@ -121,9 +126,10 @@ class FusionSniperBot:
         self.tracked_positions = {}
         
         # Cooldown tracking
+        # v5.0.0 (L1): removed unused self.trade_cooldown (is_in_cooldown uses the
+        # scalp_cooldown/normal_cooldown values from volatility_detection instead).
         self.last_trade_time = None
         self.last_trade_type = None
-        self.trade_cooldown = self.config['TRADING'].get('trade_cooldown_seconds', 60)
         
         # Trading hours from config
         trading_hours = self.config['TRADING'].get('trading_hours', {})
@@ -162,6 +168,11 @@ class FusionSniperBot:
         self.main_loop_interval = int(system_cfg.get('main_loop_interval', 10))
         self.active_loop_interval = int(system_cfg.get('active_loop_interval', self.main_loop_interval))
         self.paused_loop_interval = int(system_cfg.get('paused_loop_interval', 30))
+        # v5.0.0 (M8): throttle the repeated "scanning"/mode log lines
+        self.waiting_log_interval = int(system_cfg.get('waiting_log_interval', 300))
+        self._last_scan_log_ts = 0.0
+        self._last_pos_count = -1
+        self._last_logged_mode = None
 
         
         # VOLATILITY DETECTION
@@ -203,12 +214,59 @@ class FusionSniperBot:
         else:
             # Fallback. safe default if symbol_info is not available
             self.pip_size = 0.0001
+
+        # v5.0.0 (H2): cache symbol trading params for order normalisation/rounding.
+        if symbol_info:
+            self.symbol_digits = int(symbol_info.digits)
+            self.symbol_point = float(symbol_info.point)
+            self.volume_step = float(symbol_info.volume_step) or 0.01
+            self.volume_min = float(symbol_info.volume_min) or 0.01
+            self.volume_max = float(symbol_info.volume_max) or 100.0
+            self.trade_stops_level = int(getattr(symbol_info, "trade_stops_level", 0) or 0)
+            self.filling_mode_mask = int(getattr(symbol_info, "filling_mode", 0) or 0)
+        else:
+            self.symbol_digits = 2
+            self.symbol_point = 0.01
+            self.volume_step = 0.01
+            self.volume_min = 0.01
+            self.volume_max = 100.0
+            self.trade_stops_level = 0
+            self.filling_mode_mask = 0
+
+        # v5.0.0 (H2): order execution params from config instead of hardcoding.
+        order_exec = self.config['TRADING'].get('order_execution', {})
+        self.order_comment = order_exec.get('comment', 'fusion_sniper_v5')
+        self.order_deviation = int(order_exec.get('deviation', 10))
+        self.order_send_retries = int(order_exec.get('order_send_retries', 2))
+        # v5.0.0 (O1): minimum stop distance floor so a tiny ATR can't create an
+        # ultra-tight stop. Configurable in price; default 0.50 (= 50 points on gold).
+        self.min_stop_distance_price = float(order_exec.get('min_stop_distance_usd', 0.50))
+
+        # v5.0.0 (H3): persistent state file (entry_atr / breakeven_applied / cooldown).
+        self.state_file = Path('logs') / 'bot_state.json'
+        self._restored_state = self._load_state()
+        # Restore cooldown clock so a restart doesn't immediately re-enter.
+        lt = self._restored_state.get('last_trade_time')
+        if lt:
+            try:
+                self.last_trade_time = datetime.fromisoformat(lt)
+                self.last_trade_type = self._restored_state.get('last_trade_type', 'normal')
+            except Exception:
+                pass
+
+        # v5.0.0: simulated positions when in paper mode
+        self.paper_positions = {}
         
         # Logging
         self.logger.info("="*60)
-        self.logger.info("Fusion Sniper Bot v4.1")
+        self.logger.info("Fusion Sniper Bot v5.0.0")
         self.logger.info(f"Symbol: {self.symbol}")
         self.logger.info("="*60)
+        if self.paper_mode:
+            self.logger.warning("#" * 60)
+            self.logger.warning("### PAPER MODE ACTIVE - NO REAL ORDERS WILL BE SENT ###")
+            self.logger.warning("### order_send / modify_position are SIMULATED        ###")
+            self.logger.warning("#" * 60)
         self.logger.info(f"Magic number: {self.magic_number}")
         self.logger.info(f"Lot size: {self.lot_size}")
         self.logger.info(f"Max Concurrent Positions: {self.max_positions}")
@@ -242,7 +300,12 @@ class FusionSniperBot:
         self.logger.info("News Fetch: Continuous (even when paused)")
         
         self.telegram.notify_bot_started(self.symbol)
-        
+        if self.paper_mode:
+            try:
+                self.telegram.notify_paper_mode(self.symbol)
+            except Exception:
+                pass
+
         # Write status file for remote control
         self.write_status_file()
     
@@ -474,7 +537,255 @@ class FusionSniperBot:
             return False
 
         return True
-    
+
+    # ------------------------------------------------------------------
+    # v5.0.0 helpers: connection, state persistence, order normalisation
+    # ------------------------------------------------------------------
+    def ensure_connection(self):
+        """C1: verify the MT5 terminal is connected and the account is reachable.
+        On failure, attempt re-initialise/login with capped exponential backoff and
+        alert via Telegram. Returns True only when we have a live, logged-in session.
+        In paper mode we still want a live data feed, so we reconnect the same way."""
+        try:
+            ti = mt5.terminal_info()
+            ai = mt5.account_info()
+            if ti is not None and getattr(ti, "connected", False) and ai is not None:
+                if getattr(self, "_was_disconnected", False):
+                    self.logger.info("MT5 connection restored")
+                    self._was_disconnected = False
+                return True
+        except Exception as e:
+            self.logger.error(f"Connection check error: {e}")
+
+        # Disconnected -> alert once, then try to recover with backoff
+        if not getattr(self, "_was_disconnected", False):
+            self.logger.error("MT5 connection lost - attempting to reconnect")
+            try:
+                self.telegram.notify_connection_lost(self.symbol)
+            except Exception:
+                pass
+            self._was_disconnected = True
+
+        for attempt in range(1, 6):
+            delay = min(60, 2 ** attempt)
+            time.sleep(delay)
+            try:
+                mt5.shutdown()
+            except Exception:
+                pass
+            if self.initialize_mt5():
+                ti = mt5.terminal_info()
+                ai = mt5.account_info()
+                if ti is not None and getattr(ti, "connected", False) and ai is not None:
+                    self.logger.info(f"Reconnected to MT5 after {attempt} attempt(s)")
+                    self._was_disconnected = False
+                    return True
+            self.logger.warning(f"Reconnect attempt {attempt} failed; retrying...")
+        return False
+
+    def _manual_stop_requested(self):
+        """M11: True if the Telegram handler has requested a graceful stop via flag file."""
+        try:
+            paths = self.config.get('TELEGRAM_HANDLER', {}).get('paths', {})
+            flag = Path(paths.get('manual_stop_flag', 'logs/manual_stop.flag'))
+            return flag.exists()
+        except Exception:
+            return False
+
+    def _load_state(self):
+        """H3: load persisted {last_trade_time, last_trade_type, positions{ticket:...}}."""
+        try:
+            if self.state_file.exists():
+                with open(self.state_file, 'r') as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception as e:
+            try:
+                self.logger.error(f"Error loading state file: {e}")
+            except Exception:
+                pass
+        return {}
+
+    def _save_state(self):
+        """H3: persist cooldown clock and per-position entry_atr/breakeven_applied."""
+        try:
+            positions = {}
+            for ticket, pd in getattr(self, "tracked_positions", {}).items():
+                positions[str(ticket)] = {
+                    'entry_atr': pd.get('entry_atr', 0),
+                    'breakeven_applied': bool(pd.get('breakeven_applied', False)),
+                }
+            data = {
+                'last_trade_time': self.last_trade_time.isoformat() if self.last_trade_time else None,
+                'last_trade_type': self.last_trade_type,
+                'positions': positions,
+            }
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.logger.error(f"Error saving state file: {e}")
+
+    def _select_filling_mode(self):
+        """H2: choose a fill mode the symbol actually supports (mask is a bitfield)."""
+        mask = getattr(self, "filling_mode_mask", 0)
+        # SYMBOL_FILLING_FOK=1, SYMBOL_FILLING_IOC=2
+        if mask & 2:
+            return mt5.ORDER_FILLING_IOC
+        if mask & 1:
+            return mt5.ORDER_FILLING_FOK
+        return mt5.ORDER_FILLING_RETURN
+
+    def _normalize_volume(self, volume):
+        """H2: snap volume to volume_step and clamp to [volume_min, volume_max]."""
+        step = self.volume_step or 0.01
+        vol = round(round(volume / step) * step, 8)
+        vol = max(self.volume_min, min(self.volume_max, vol))
+        # round to the step's decimal places to avoid float noise
+        decimals = max(0, len(str(step).split('.')[-1])) if '.' in str(step) else 0
+        return round(vol, decimals)
+
+    def _round_price(self, price):
+        """H2: round a price to the symbol's digits."""
+        return round(float(price), self.symbol_digits)
+
+    def _apply_stop_floor(self, price, sl, tp, direction):
+        """O1 + H2: enforce a minimum stop distance (max of broker stops-level and the
+        configured floor), then round to digits. Returns (sl, tp)."""
+        broker_min = self.trade_stops_level * self.symbol_point
+        min_dist = max(broker_min, self.min_stop_distance_price)
+        if direction == 'BUY':
+            if (price - sl) < min_dist:
+                sl = price - min_dist
+            if (tp - price) < min_dist:
+                tp = price + min_dist
+        else:  # SELL
+            if (sl - price) < min_dist:
+                sl = price + min_dist
+            if (price - tp) < min_dist:
+                tp = price - min_dist
+        return self._round_price(sl), self._round_price(tp)
+
+    def _order_send_retry(self, request, refresh_price=False):
+        """H2: send an order with a bounded retry on requote/price-changed retcodes.
+        When refresh_price is True (market entries), re-read the tick price between tries.
+        Returns the final result object (or None)."""
+        retryable = {
+            getattr(mt5, "TRADE_RETCODE_REQUOTE", 10004),
+            getattr(mt5, "TRADE_RETCODE_PRICE_CHANGED", 10020),
+            getattr(mt5, "TRADE_RETCODE_PRICE_OFF", 10021),
+            getattr(mt5, "TRADE_RETCODE_REJECT", 10006),
+        }
+        result = None
+        for attempt in range(self.order_send_retries + 1):
+            if refresh_price and attempt > 0:
+                tick = mt5.symbol_info_tick(self.symbol)
+                if tick is not None:
+                    request["price"] = tick.ask if request["type"] == mt5.ORDER_TYPE_BUY else tick.bid
+            result = mt5.order_send(request)
+            if result is None:
+                self.logger.error(f"Order send returned None (attempt {attempt+1}). last_error: {mt5.last_error()}")
+                continue
+            if result.retcode == mt5.TRADE_RETCODE_DONE:
+                return result
+            if result.retcode in retryable and attempt < self.order_send_retries:
+                self.logger.warning(f"Order retcode {result.retcode} ({result.comment}); retry {attempt+1}")
+                time.sleep(0.5)
+                continue
+            return result
+        return result
+
+    def _get_open_positions(self):
+        """Return this bot's open positions as position-like objects.
+
+        LIVE: real MT5 positions filtered by magic (None on query error -- callers
+        must NOT treat None as 'flat'). PAPER: SimpleNamespace wrappers around the
+        simulated positions, with a fresh floating profit computed from the tick."""
+        if self.paper_mode:
+            tick = mt5.symbol_info_tick(self.symbol)
+            out = []
+            for p in list(self.paper_positions.values()):
+                cur = (tick.bid if p['type'] == 0 else tick.ask) if tick else p['price_open']
+                profit = 0.0
+                try:
+                    action = mt5.ORDER_TYPE_BUY if p['type'] == 0 else mt5.ORDER_TYPE_SELL
+                    calc = mt5.order_calc_profit(action, self.symbol, p['volume'], p['price_open'], cur)
+                    profit = float(calc) if calc is not None else 0.0
+                except Exception:
+                    profit = 0.0
+                p['profit'] = profit
+                out.append(SimpleNamespace(price_current=cur, **p))
+            return out
+
+        positions = mt5.positions_get(symbol=self.symbol)
+        if positions is None:
+            return None  # query error / disconnect -- do NOT treat as flat
+        return [p for p in positions if p.magic == self.magic_number]
+
+    def _paper_check_sl_tp(self, position):
+        """PAPER: simulate the broker closing a position on SL/TP touch."""
+        tick = mt5.symbol_info_tick(self.symbol)
+        if tick is None:
+            return False
+        if position.type == 0:  # BUY -> exits on bid
+            if position.sl > 0 and tick.bid <= position.sl:
+                self._close_paper_position(position.ticket, position.sl, "Stop Loss hit")
+                return True
+            if position.tp > 0 and tick.bid >= position.tp:
+                self._close_paper_position(position.ticket, position.tp, "Take Profit hit")
+                return True
+        else:  # SELL -> exits on ask
+            if position.sl > 0 and tick.ask >= position.sl:
+                self._close_paper_position(position.ticket, position.sl, "Stop Loss hit")
+                return True
+            if position.tp > 0 and tick.ask <= position.tp:
+                self._close_paper_position(position.ticket, position.tp, "Take Profit hit")
+                return True
+        return False
+
+    def _close_paper_position(self, ticket, exit_price, reason, scalp=False):
+        """PAPER: simulate a close -> log, record stats, notify, drop the sim position."""
+        pos = self.paper_positions.get(ticket)
+        if pos is None:
+            return
+        direction = "BUY" if pos['type'] == 0 else "SELL"
+        profit = 0.0
+        try:
+            action = mt5.ORDER_TYPE_BUY if pos['type'] == 0 else mt5.ORDER_TYPE_SELL
+            calc = mt5.order_calc_profit(action, self.symbol, pos['volume'], pos['price_open'], exit_price)
+            profit = float(calc) if calc is not None else 0.0
+        except Exception:
+            profit = 0.0
+        self.logger.warning(
+            f"[PAPER] Would CLOSE #{ticket} {direction} @ {exit_price} ({reason}) P&L {profit:.2f}"
+        )
+        profit_pips = abs(exit_price - pos['price_open']) / self.pip_size
+        if profit < 0:
+            profit_pips = -profit_pips
+        try:
+            self.stats_tracker.end_trade({
+                'exit_price': exit_price,
+                'exit_reason': reason,
+                'profit': profit,
+                'profit_pips': profit_pips,
+                'expected_exit': pos['tp'] if profit > 0 else pos['sl'],
+            })
+        except Exception:
+            pass
+        try:
+            self.telegram.notify_trade_closed(
+                symbol=self.symbol, direction=direction, lot_size=pos['volume'],
+                entry_price=pos['price_open'], exit_price=exit_price, profit=profit, reason=reason)
+        except Exception:
+            pass
+        self.paper_positions.pop(ticket, None)
+        self.tracked_positions.pop(ticket, None)
+        if scalp:
+            self.last_trade_time = datetime.now()
+            self.last_trade_type = 'scalp'
+        self._save_state()
+
     def calculate_atr(self, timeframe=None, period=None, closed_only=True):
         """Calculate Average True Range.
 
@@ -549,17 +860,21 @@ class FusionSniperBot:
         
         try:
             current_profit = position.profit
-            
+
             if current_profit >= self.scalp_profit_target:
                 self.logger.info(f"SCALP EXIT | Profit: £{current_profit:.2f}")
-                
+
                 tick = mt5.symbol_info_tick(self.symbol)
                 if tick is None:
                     return False
-                
+
                 close_price = tick.bid if position.type == 0 else tick.ask
+
+                if self.paper_mode:
+                    self._close_paper_position(position.ticket, close_price, "Quick scalp profit", scalp=True)
+                    return True
+
                 close_type = mt5.ORDER_TYPE_SELL if position.type == 0 else mt5.ORDER_TYPE_BUY
-                
                 request = {
                     "action": mt5.TRADE_ACTION_DEAL,
                     "symbol": position.symbol,
@@ -567,21 +882,26 @@ class FusionSniperBot:
                     "type": close_type,
                     "position": position.ticket,
                     "price": close_price,
-                    "deviation": 20,
+                    "deviation": self.order_deviation,
                     "magic": self.magic_number,
                     "comment": "scalp_quick_profit",
                     "type_time": mt5.ORDER_TIME_GTC,
-                    "type_filling": mt5.ORDER_FILLING_IOC,
+                    "type_filling": self._select_filling_mode(),
                 }
-                
-                result = mt5.order_send(request)
-                
+
+                result = self._order_send_retry(request, refresh_price=False)
+
                 if result and result.retcode == mt5.TRADE_RETCODE_DONE:
                     self.last_trade_time = datetime.now()
                     self.last_trade_type = 'scalp'
+                    self._save_state()
                     self.logger.info(f"Position closed | Ticket: {position.ticket}")
                     return True
-                    
+                else:
+                    self.logger.error(
+                        f"Scalp close failed for #{position.ticket}: "
+                        f"{getattr(result, 'retcode', None)} {mt5.last_error()}")
+
         except Exception as e:
             self.logger.error(f"Error in quick profit exit: {e}")
         
@@ -725,12 +1045,8 @@ class FusionSniperBot:
     def _has_open_positions_for_bot(self):
         """Return True if there are any open positions for this bot on this symbol."""
         try:
-            positions = mt5.positions_get(symbol=self.symbol)
-            if not positions:
-                return False
-            for pos in positions:
-                if pos.magic == self.magic_number:
-                    return True
+            positions = self._get_open_positions()
+            return bool(positions)
         except Exception as e:
             self.logger.debug(f"Position lookup failed. {e}")
         return False
@@ -895,7 +1211,9 @@ class FusionSniperBot:
                         current_equity = float(account_info.equity)
                         starting_equity = getattr(self, 'starting_equity_today', None)
                         if starting_equity is None:
-                            self.starting_equity_today = float(account_info.balance)
+                            # v5.0.0 (M10): seed from EQUITY (includes any floating P&L at
+                            # the day boundary), not balance, so the drawdown base is correct.
+                            self.starting_equity_today = float(account_info.equity)
                             starting_equity = self.starting_equity_today
 
                         drawdown = starting_equity - current_equity
@@ -1149,28 +1467,45 @@ class FusionSniperBot:
         return False, 0
     
     def update_tracked_positions(self):
-        """Update tracked positions"""
+        """Update tracked positions.
+
+        v5.0.0 (H3): when first registering an open position, restore its entry_atr and
+        breakeven_applied from the persisted state file if present (so a restart doesn't
+        reset the breakeven flag or recompute entry_atr from the wrong, current ATR).
+        Also: a None result (query error/disconnect) is NOT treated as 'all closed'.
+        """
         try:
-            current_positions = mt5.positions_get(symbol=self.symbol)
+            current_positions = self._get_open_positions()
             if current_positions is None:
-                current_positions = []
-            
-            current_positions = [p for p in current_positions if p.magic == self.magic_number]
+                return  # query error -- skip; do not spuriously mark positions closed
+
+            current_positions = list(current_positions)
             current_tickets = set([p.ticket for p in current_positions])
-            
+
             tracked_tickets = set(self.tracked_positions.keys())
             closed_tickets = tracked_tickets - current_tickets
-            
+
             for ticket in closed_tickets:
-                self.handle_position_closure(ticket)
+                if not self.paper_mode:
+                    self.handle_position_closure(ticket)  # paper closes handled inline
                 del self.tracked_positions[ticket]
-            
+
+            restored = (self._restored_state or {}).get('positions', {})
             for position in current_positions:
                 if position.ticket not in self.tracked_positions:
-                    entry_atr = self.calculate_atr()
-                    if entry_atr is None:
-                        entry_atr = 0
-                    
+                    saved = restored.get(str(position.ticket))
+                    if saved:  # restore across restart
+                        entry_atr = saved.get('entry_atr', 0) or 0
+                        breakeven_applied = bool(saved.get('breakeven_applied', False))
+                        self.logger.info(
+                            f"Restored state for #{position.ticket}: "
+                            f"entry_atr={entry_atr}, breakeven_applied={breakeven_applied}")
+                    else:
+                        entry_atr = self.calculate_atr()
+                        if entry_atr is None:
+                            entry_atr = 0
+                        breakeven_applied = False
+
                     self.tracked_positions[position.ticket] = {
                         'entry': position.price_open,
                         'sl': position.sl,
@@ -1179,8 +1514,9 @@ class FusionSniperBot:
                         'volume': position.volume,
                         'open_time': position.time,
                         'entry_atr': entry_atr,
-                        'breakeven_applied': False,
+                        'breakeven_applied': breakeven_applied,
                     }
+                    self._save_state()
         except Exception as e:
             self.logger.error(f"Error updating tracked positions: {e}")
     
@@ -1204,41 +1540,50 @@ class FusionSniperBot:
             if exit_deal is None:
                 return
             
-            profit = exit_deal.profit
+            # v5.0.0 (M3): report NET per trade (gross - commission + swap) so per-trade
+            # Telegram/stats values are on the SAME basis as the daily/weekly caps.
+            gross_profit = exit_deal.profit
+            total_commission = sum(abs(getattr(d, 'commission', 0.0)) for d in deals)
+            total_swap = sum(getattr(d, 'swap', 0.0) for d in deals if d.entry == mt5.DEAL_ENTRY_OUT)
+            net_profit = gross_profit - total_commission + total_swap
+
             direction = "BUY" if pos_data['type'] == 0 else "SELL"
             exit_price = exit_deal.price
             entry_price = pos_data['entry']
-            
+
             if exit_deal.comment == "scalp_quick_profit":
                 reason = "Quick scalp profit"
             else:
                 reason = self.determine_close_reason(exit_price, pos_data['sl'], pos_data['tp'], direction)
-            
+
             self.telegram.notify_trade_closed(
                 symbol=self.symbol,
                 direction=direction,
                 lot_size=pos_data['volume'],
                 entry_price=entry_price,
                 exit_price=exit_price,
-                profit=profit,
+                profit=net_profit,
                 reason=reason
             )
-            
+
             profit_pips = abs(exit_price - entry_price) / self.pip_size
-            if (direction == "SELL" and profit < 0) or (direction == "BUY" and profit < 0):
+            if net_profit < 0:   # v5.0.0 (L2): direction-independent (old check was redundant)
                 profit_pips = -profit_pips
-            
-            expected_exit = pos_data['tp'] if profit > 0 else pos_data['sl']
-            
+
+            expected_exit = pos_data['tp'] if net_profit > 0 else pos_data['sl']
+
             self.stats_tracker.end_trade({
                 'exit_price': exit_price,
                 'exit_reason': reason,
-                'profit': profit,
+                'profit': net_profit,
                 'profit_pips': profit_pips,
                 'expected_exit': expected_exit if expected_exit > 0 else exit_price
             })
-            
-            self.logger.info(f"Position closed: #{ticket}, {direction}, £{profit:.2f}, {reason}")
+
+            self.logger.info(
+                f"Position closed: #{ticket}, {direction}, net £{net_profit:.2f} "
+                f"(gross £{gross_profit:.2f}), {reason}")
+            self._save_state()
         except Exception as e:
             self.logger.error(f"Error handling closure: {e}")
     
@@ -1309,79 +1654,70 @@ class FusionSniperBot:
                 self.logger.warning("RiskManager returned invalid stops")
                 return False
             
-            # Broker minimum distance validation
-            symbol_info = mt5.symbol_info(self.symbol)
-            if symbol_info is None:
-                self.logger.error("Failed to get symbol info")
-                return False
-            
-            min_distance_points = symbol_info.trade_stops_level
-            min_distance_price = min_distance_points * symbol_info.point
-            
-            sl_distance = abs(price - sl)
-            tp_distance = abs(tp - price)
-            
-            if sl_distance < min_distance_price:
-                if order_type == 'BUY':
-                    sl = price - min_distance_price
-                    tp = price + (min_distance_price * 2.0)
-                else:
-                    sl = price + min_distance_price
-                    tp = price - (min_distance_price * 2.0)
-            
-            if tp_distance < min_distance_price:
-                if order_type == 'BUY':
-                    tp = price + max(tp_distance, min_distance_price)
-                else:
-                    tp = price - max(tp_distance, min_distance_price)
-            
+            # v5.0.0 (O1+H2): enforce minimum stop distance floor and round to digits
+            sl, tp = self._apply_stop_floor(price, sl, tp, order_type)
+            price = self._round_price(price)
+
             # Validate with risk manager
             if not self.risk_manager.validate_trade(order_type, price, sl, tp):
                 self.logger.warning("Risk manager validation failed")
                 return False
-            
-            # Send order
-            request = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": self.symbol,
-                "volume": self.lot_size,
-                "type": mt5_order_type,
-                "price": price,
-                "sl": sl,
-                "tp": tp,
-                "deviation": 10,
-                "magic": self.magic_number,
-                "comment": "fusion_sniper_bot_v4",
-                "type_time": mt5.ORDER_TIME_GTC,
-                "type_filling": mt5.ORDER_FILLING_IOC,
-            }
-            
-            result = mt5.order_send(request)
 
-            if result is None:
-                # Log the underlying MT5 error for diagnosis
-                last_error = mt5.last_error()
-                self.logger.error(f"Order send failed: No result. MT5 last_error: {last_error}")
-                return False
+            # v5.0.0 (H2): normalise volume to the symbol's step/min/max
+            volume = self._normalize_volume(self.lot_size)
 
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
-                self.logger.error(f"Trade rejected: {result.retcode} - {result.comment}")
-                return False
-            
-            # Trade successful
-            self.logger.info(f"Trade opened: {order_type} @ {price:.5f}, SL: {sl:.5f}, TP: {tp:.5f}, Ticket: {result.order}")
-            
-            self.last_trade_time = datetime.now()
-            self.last_trade_type = 'normal'
-            
             symbol_info = mt5.symbol_info(self.symbol)
             spread = symbol_info.spread * symbol_info.point if symbol_info else 0
-            
+
+            # ---- Resolve the fill: PAPER (simulated) vs LIVE (broker) ----
+            if self.paper_mode:
+                self._paper_ticket_seq += 1
+                ticket = self._paper_ticket_seq
+                self.logger.warning(
+                    f"[PAPER] Would OPEN {order_type} {volume} {self.symbol} @ {price} "
+                    f"SL {sl} TP {tp} (ticket {ticket})"
+                )
+                self.paper_positions[ticket] = {
+                    'ticket': ticket, 'type': 0 if order_type == 'BUY' else 1,
+                    'price_open': price, 'sl': sl, 'tp': tp, 'volume': volume,
+                    'magic': self.magic_number, 'symbol': self.symbol,
+                    'time': int(datetime.now().timestamp()), 'profit': 0.0,
+                }
+            else:
+                request = {
+                    "action": mt5.TRADE_ACTION_DEAL,
+                    "symbol": self.symbol,
+                    "volume": volume,
+                    "type": mt5_order_type,
+                    "price": price,
+                    "sl": sl,
+                    "tp": tp,
+                    "deviation": self.order_deviation,
+                    "magic": self.magic_number,
+                    "comment": self.order_comment,
+                    "type_time": mt5.ORDER_TIME_GTC,
+                    "type_filling": self._select_filling_mode(),
+                }
+                result = self._order_send_retry(request, refresh_price=True)
+                if result is None:
+                    self.logger.error(f"Order send failed: No result. MT5 last_error: {mt5.last_error()}")
+                    return False
+                if result.retcode != mt5.TRADE_RETCODE_DONE:
+                    self.logger.error(f"Trade rejected: {result.retcode} - {result.comment}")
+                    return False
+                ticket = result.order
+                self.logger.info(
+                    f"Trade opened: {order_type} @ {price}, SL: {sl}, TP: {tp}, Ticket: {ticket}"
+                )
+
+            self.last_trade_time = datetime.now()
+            self.last_trade_type = 'normal'
+
             self.stats_tracker.start_trade({
-                'ticket': result.order,
+                'ticket': ticket,
                 'order_type': order_type,
                 'entry_price': price,
-                'lot_size': self.lot_size,
+                'lot_size': volume,
                 'stop_loss': sl,
                 'take_profit': tp,
                 'atr': current_atr,
@@ -1392,16 +1728,17 @@ class FusionSniperBot:
                 'session': self.get_current_session(),
                 'volatility_mode': self.current_mode
             })
-            
+
             self.telegram.notify_trade_opened(
                 symbol=self.symbol,
                 direction=order_type,
-                lot_size=self.lot_size,
+                lot_size=volume,
                 entry_price=price,
                 sl_price=sl,
                 tp_price=tp
             )
-            
+
+            self._save_state()
             return True
         except Exception as e:
             self.logger.error(f"Error opening trade: {e}")
@@ -1410,21 +1747,22 @@ class FusionSniperBot:
     def manage_positions(self):
         """Manage positions with ATR-based break-even and trailing"""
         try:
-            positions = mt5.positions_get(symbol=self.symbol)
-            if positions is None or len(positions) == 0:
+            positions = self._get_open_positions()
+            if not positions:   # None (query error) or empty -> nothing to manage
                 return
-            
+
             for position in positions:
-                if position.magic != self.magic_number:
-                    continue
-                
                 # Update statistics
                 self.stats_tracker.update_trade({'current_profit': position.profit})
-                
+
                 # Quick scalp exit
                 if self.check_quick_profit_exit(position):
                     continue
-                
+
+                # PAPER: simulate broker SL/TP execution (live broker does this itself)
+                if self.paper_mode and self._paper_check_sl_tp(position):
+                    continue
+
                 # Get position tracking data
                 if position.ticket not in self.tracked_positions:
                     continue
@@ -1470,6 +1808,7 @@ class FusionSniperBot:
                     if new_sl > position.sl:
                         if self.modify_position(position.ticket, new_sl, position.tp):
                             pos_data['breakeven_applied'] = True
+                            self._save_state()  # H3: persist breakeven flag
                             self.logger.info(f"Break-even activated: #{position.ticket}, New SL: {new_sl:.5f}")
                             self.telegram.notify_breakeven_activated(self.symbol, position.ticket, current_price)
             else:  # SELL
@@ -1479,6 +1818,7 @@ class FusionSniperBot:
                     if new_sl < position.sl:
                         if self.modify_position(position.ticket, new_sl, position.tp):
                             pos_data['breakeven_applied'] = True
+                            self._save_state()  # H3: persist breakeven flag
                             self.logger.info(f"Break-even activated: #{position.ticket}, New SL: {new_sl:.5f}")
                             self.telegram.notify_breakeven_activated(self.symbol, position.ticket, current_price)
         except Exception as e:
@@ -1515,18 +1855,38 @@ class FusionSniperBot:
             self.logger.error(f"Error applying Chandelier trailing: {e}")
     
     def modify_position(self, ticket, new_sl, new_tp):
-        """Modify position SL/TP"""
+        """Modify position SL/TP.
+
+        v5.0.0 (H1): round prices to digits, check the retcode, LOG last_error/retcode
+        on failure (was silent), and retry via the bounded helper. Simulated in paper mode.
+        """
         try:
+            new_sl = self._round_price(new_sl)
+            new_tp = self._round_price(new_tp)
+
+            if self.paper_mode:
+                pos = self.paper_positions.get(ticket)
+                if pos is not None:
+                    pos['sl'] = new_sl
+                    pos['tp'] = new_tp
+                self.logger.warning(f"[PAPER] Would MODIFY #{ticket} -> SL {new_sl} TP {new_tp}")
+                return True
+
             request = {
                 "action": mt5.TRADE_ACTION_SLTP,
                 "symbol": self.symbol,
                 "position": ticket,
                 "sl": new_sl,
-                "tp": new_tp
+                "tp": new_tp,
             }
-            
-            result = mt5.order_send(request)
-            return result and result.retcode == mt5.TRADE_RETCODE_DONE
+            result = self._order_send_retry(request, refresh_price=False)
+            if result is None:
+                self.logger.error(f"Modify #{ticket} failed: no result. last_error: {mt5.last_error()}")
+                return False
+            if result.retcode != mt5.TRADE_RETCODE_DONE:
+                self.logger.error(f"Modify #{ticket} rejected: {result.retcode} - {result.comment}")
+                return False
+            return True
         except Exception as e:
             self.logger.error(f"Error modifying position: {e}")
             return False
@@ -1558,124 +1918,140 @@ class FusionSniperBot:
         """Main bot loop"""
         last_status_message = ""
         status_message_counter = 0
-        
+        consecutive_errors = 0   # v5.0.0 (C3)
+
         try:
             while self.running:
-                # Rotate to a new daily log file after local midnight if needed
-                self.rotate_log_file_if_needed()
+                # v5.0.0 (C3): every iteration is wrapped so a transient error logs and
+                # CONTINUES instead of killing the bot. A run of errors backs off and alerts.
+                try:
+                    # v5.0.0 (M11): a manual stop flag means a graceful, clean shutdown.
+                    if self._manual_stop_requested():
+                        self.logger.info("Manual stop flag detected - shutting down gracefully")
+                        break
 
-                is_open, status_msg = self.is_within_trading_hours()
-                
-                if not is_open:
-                    if status_msg != last_status_message:
-                        self.logger.warning(f"[CLOSED] {status_msg}")
+                    # Rotate to a new daily log file after local midnight if needed
+                    self.rotate_log_file_if_needed()
+
+                    # v5.0.0 (C1): ensure we have a live, logged-in MT5 session.
+                    if not self.ensure_connection():
+                        self.logger.error("MT5 still disconnected after retries; pausing this cycle")
+                        time.sleep(30)
+                        consecutive_errors = 0  # not a code error; don't escalate
+                        continue
+
+                    is_open, status_msg = self.is_within_trading_hours()
+
+                    if not is_open:
+                        if status_msg != last_status_message:
+                            self.logger.warning(f"[CLOSED] {status_msg}")
+                            last_status_message = status_msg
+                            status_message_counter = 0
+                        else:
+                            status_message_counter += 1
+                            if status_message_counter % 5 == 0:
+                                self.logger.info(f"[HEARTBEAT] Bot alive | {status_msg}")
+
+                        time.sleep(60)
+                        consecutive_errors = 0
+                        continue
+
+                    if last_status_message != status_msg:
+                        self.logger.info(f"[OPEN] {status_msg}")
                         last_status_message = status_msg
-                        status_message_counter = 0
-                    else:
-                        status_message_counter += 1
-                        if status_message_counter % 5 == 0:
-                            self.logger.info(f"[HEARTBEAT] Bot alive | {status_msg}")
-                    
-                    time.sleep(60)
-                    continue
-                
-                if last_status_message != status_msg:
-                    self.logger.info(f"[OPEN] {status_msg}")
-                    last_status_message = status_msg
 
-                # Check if weekly news summary should be sent
-                self.check_and_send_weekly_news_summary()
-                
-                # Ensure news data is fresh regardless of pause status
-                # This keeps /news command data up to date even when bot is paused
-                self.ensure_news_data_fresh()
-                
-                # Check news avoidance status. do this BEFORE checking daily target
-                # This ensures we log news avoidance even when paused for daily profit
-                avoiding_news, news_event = self.news_filter.should_avoid_trading()
-                if avoiding_news:
-                    event_key = f"{news_event['title']}_{news_event['time']}"
-                    
-                    # Send alert once per event
-                    if event_key not in self.alerted_news_events:
-                        self.telegram.notify_news_avoidance(news_event)
-                        self.alerted_news_events.add(event_key)
-                        self.logger.info(f"News avoidance alert sent: {news_event['title']}")
-                    
-                    # Log that we are avoiding (visible even when paused for daily target)
-                    self.logger.info(f"[NEWS FILTER] Avoiding trading: {news_event['title']}")
-                
-                target_reached = self.check_daily_profit()
-                
-                # Daily and weekly risk caps
-                daily_paused = self.check_daily_profit()
-                weekly_paused = self.check_weekly_limits()
+                    # Check if weekly news summary should be sent
+                    self.check_and_send_weekly_news_summary()
 
-                # Check swap or rollover avoidance window (server time)
-                in_swap_window, swap_msg = self.is_in_swap_avoidance_window()
-                if in_swap_window:
-                    self.logger.info(f"[SWAP] Avoiding new trades: {swap_msg}")
-                
-                # Update ATR and mode
-                self.update_trading_mode()
+                    # Ensure news data is fresh regardless of pause status
+                    self.ensure_news_data_fresh()
 
-                # Extreme ATR filter. skip new trades if volatility is insane
-                extreme_volatility = False
-                if (
-                    getattr(self, "skip_on_extreme_atr", False)
-                    and self.current_atr is not None
-                    and self.atr_max_for_trading is not None
-                ):
-                    if self.current_atr > self.atr_max_for_trading:
-                        extreme_volatility = True
-                        self.logger.info(
-                            f"[VOL] ATR {self.current_atr:.4f} above max {self.atr_max_for_trading:.4f}. "
-                            "Skipping new trades due to extreme volatility"
-                        )
-               
-                if self.volatility_enabled and self.current_atr:
-                    mode_label = "[SCALP]" if self.current_mode == 'scalp' else "[NORMAL]"
-                    self.logger.info(f"{mode_label} Mode: {self.current_mode.upper()} | ATR: {self.current_atr:.4f}")
-                
-                self.update_tracked_positions()
-                
-                positions = mt5.positions_get(symbol=self.symbol)
-                if positions is None:
-                    positions = []
-                
-                bot_positions = [p for p in positions if p.magic == self.magic_number]
-                position_count = len(bot_positions)
-                
-                if target_reached:
-                    self.logger.info(f"[PAUSED] Daily limit active | Managing {position_count} position(s)")
-                else:
-                    self.logger.info(f"Scanning market... (Positions: {position_count})")
-                
-                if position_count > 0:
-                    self.manage_positions()
-                
-                # Look for new trades. only when not paused by daily or weekly caps, news, swap window, or extreme ATR
-                if (
-                    self._can_open_additional_position(bot_positions)
-                    and not daily_paused
-                    and not weekly_paused
-                    and not avoiding_news
-                    and not in_swap_window
-                    and not extreme_volatility
-                ):
-                    in_cooldown, remaining = self.is_in_cooldown()
-                    if in_cooldown:
-                        self.logger.info(f"In cooldown: {remaining}s remaining")
-                    else:
-                        # News already checked above, now just check risk manager
-                        if self.risk_manager.can_trade():
-                            # Read market_data_bars from config
+                    # Check news avoidance status. do this BEFORE checking daily target
+                    avoiding_news, news_event = self.news_filter.should_avoid_trading()
+                    if avoiding_news:
+                        event_key = f"{news_event['title']}_{news_event['time']}"
+                        if event_key not in self.alerted_news_events:
+                            self.telegram.notify_news_avoidance(news_event)
+                            self.alerted_news_events.add(event_key)
+                            self.logger.info(f"News avoidance alert sent: {news_event['title']}")
+                        self.logger.info(f"[NEWS FILTER] Avoiding trading: {news_event['title']}")
+
+                    # v5.0.0 (M9): single authoritative daily check per iteration
+                    daily_paused = self.check_daily_profit()
+                    weekly_paused = self.check_weekly_limits()
+
+                    # Check swap or rollover avoidance window (server time)
+                    in_swap_window, swap_msg = self.is_in_swap_avoidance_window()
+                    if in_swap_window:
+                        self.logger.info(f"[SWAP] Avoiding new trades: {swap_msg}")
+
+                    # Update ATR and mode
+                    self.update_trading_mode()
+
+                    # Extreme ATR filter. skip new trades if volatility is insane
+                    extreme_volatility = False
+                    if (
+                        getattr(self, "skip_on_extreme_atr", False)
+                        and self.current_atr is not None
+                        and self.atr_max_for_trading is not None
+                    ):
+                        if self.current_atr > self.atr_max_for_trading:
+                            extreme_volatility = True
+                            self.logger.info(
+                                f"[VOL] ATR {self.current_atr:.4f} above max {self.atr_max_for_trading:.4f}. "
+                                "Skipping new trades due to extreme volatility"
+                            )
+
+                    # v5.0.0 (M8): only log the mode line when it CHANGES
+                    if self.volatility_enabled and self.current_atr:
+                        if self.current_mode != self._last_logged_mode:
+                            mode_label = "[SCALP]" if self.current_mode == 'scalp' else "[NORMAL]"
+                            self.logger.info(
+                                f"{mode_label} Mode: {self.current_mode.upper()} | ATR: {self.current_atr:.4f}")
+                            self._last_logged_mode = self.current_mode
+
+                    self.update_tracked_positions()
+
+                    # v5.0.0 (C1): never treat a None positions result as 'flat'
+                    bot_positions = self._get_open_positions()
+                    if bot_positions is None:
+                        self.logger.warning("Position query failed this cycle; skipping")
+                        time.sleep(self.active_loop_interval)
+                        consecutive_errors = 0
+                        continue
+                    position_count = len(bot_positions)
+
+                    # v5.0.0 (M8): throttle the repeated scanning/paused log line
+                    now_ts = time.time()
+                    if (position_count != self._last_pos_count
+                            or (now_ts - self._last_scan_log_ts) >= self.waiting_log_interval):
+                        if daily_paused:
+                            self.logger.info(f"[PAUSED] Daily limit active | Managing {position_count} position(s)")
+                        else:
+                            self.logger.info(f"Scanning market... (Positions: {position_count})")
+                        self._last_scan_log_ts = now_ts
+                        self._last_pos_count = position_count
+
+                    if position_count > 0:
+                        self.manage_positions()
+
+                    # Look for new trades only when not paused by any gate
+                    if (
+                        self._can_open_additional_position(bot_positions)
+                        and not daily_paused
+                        and not weekly_paused
+                        and not avoiding_news
+                        and not in_swap_window
+                        and not extreme_volatility
+                    ):
+                        in_cooldown, remaining = self.is_in_cooldown()
+                        if in_cooldown:
+                            self.logger.info(f"In cooldown: {remaining}s remaining")
+                        elif self.risk_manager.can_trade():
                             order_execution = self.config['TRADING'].get('order_execution', {})
                             bars_to_fetch = int(order_execution.get('market_data_bars', 250))
 
                             signal = None
-
-                            # Fetch entry timeframe data and gate on closed candles
                             entry_rates = self.get_market_data(
                                 bars=bars_to_fetch,
                                 timeframe=getattr(self, "entry_timeframe", self.timeframe),
@@ -1686,7 +2062,6 @@ class FusionSniperBot:
                                 if self.last_entry_bar_time != entry_bar_time:
                                     self.last_entry_bar_time = entry_bar_time
 
-                                    # Update structure bias on a new closed bias candle
                                     bias_rates = self.get_market_data(
                                         bars=max(250, bars_to_fetch),
                                         timeframe=getattr(self, "bias_timeframe", self.timeframe),
@@ -1714,24 +2089,48 @@ class FusionSniperBot:
                                         signal = self.strategy.analyze_from_rates(entry_rates, bias=self.last_market_bias)
                                     else:
                                         self.logger.info(
-                                            f"[BIAS] {self.bias_timeframe_str} bias is NEUTRAL. skipping entries"
-                                        )
+                                            f"[BIAS] {self.bias_timeframe_str} bias is NEUTRAL. skipping entries")
+
+                            # v5.0.0 (M12): require the signal direction to MATCH the
+                            # structure bias when strict_bias is on (BUY<->BULL, SELL<->BEAR).
+                            if signal and self.strict_bias:
+                                want = 'BULL' if signal['type'] == 'BUY' else 'BEAR'
+                                if self.last_market_bias != want:
+                                    self.logger.info(
+                                        f"[BIAS] {signal['type']} signal rejected: bias is "
+                                        f"{self.last_market_bias}, needs {want}")
+                                    signal = None
 
                             if signal:
                                 self.logger.info(f"Trade signal: {signal['type']} | bias={self.last_market_bias}")
                                 self.open_trade(signal)
-                
-                # Loop cadence. slow down when paused for the day. run faster when managing open positions
-                if target_reached:
-                    sleep_interval = self.paused_loop_interval
-                else:
-                    sleep_interval = self.active_loop_interval if position_count > 0 else self.main_loop_interval
-                time.sleep(sleep_interval)
-        
+
+                    # Loop cadence
+                    if daily_paused:
+                        sleep_interval = self.paused_loop_interval
+                    else:
+                        sleep_interval = self.active_loop_interval if position_count > 0 else self.main_loop_interval
+                    time.sleep(sleep_interval)
+                    consecutive_errors = 0   # healthy iteration
+
+                except KeyboardInterrupt:
+                    raise
+                except Exception as e:
+                    # v5.0.0 (C3): log and keep running; back off and alert if it persists
+                    consecutive_errors += 1
+                    self.logger.error(f"Error in main loop (#{consecutive_errors}): {e}", exc_info=True)
+                    if consecutive_errors in (3, 10, 30):
+                        try:
+                            self.telegram.notify_error(self.symbol, "Main loop error",
+                                                       f"{consecutive_errors} consecutive errors: {e}")
+                        except Exception:
+                            pass
+                    time.sleep(min(60, 5 * consecutive_errors))
+
         except KeyboardInterrupt:
             self.logger.info("Bot stopped by user")
         except Exception as e:
-            self.logger.error(f"Error in main loop: {e}")
+            self.logger.error(f"Fatal error in main loop: {e}")
         finally:
             self.shutdown()
     
@@ -1775,26 +2174,32 @@ class FusionSniperBot:
         """Cleanup on shutdown"""
         self.logger.info("Shutting down bot...")
         self.running = False
-        
+
         self.stats_tracker.save_stats()
+        self._save_state()   # v5.0.0 (H3): persist cooldown + per-position state
         self.remove_status_file()
-        
+
         mt5.shutdown()
         self.logger.info("Bot shut down complete")
-        
+
         self.telegram.notify_shutdown(self.symbol)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python main_bot.py <config_file>")
+    # v5.0.0: accept "--paper" anywhere; config file is the first positional arg.
+    args = sys.argv[1:]
+    paper = '--paper' in args
+    positional = [a for a in args if not a.startswith('--')]
+
+    if not positional:
+        print("Usage: python main_bot.py <config_file> [--paper]")
         sys.exit(1)
-    
-    config_file = sys.argv[1]
-    
+
+    config_file = positional[0]
+
     if not Path(config_file).exists():
         print(f"Config file not found: {config_file}")
         sys.exit(1)
-    
-    bot = FusionSniperBot(config_file)
+
+    bot = FusionSniperBot(config_file, paper_mode=paper)
     bot.run()
