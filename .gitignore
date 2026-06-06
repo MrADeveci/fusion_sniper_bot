@@ -61,3 +61,9 @@ coverage.xml
 
 # OS trash
 .Trash-*/
+
+# Exported market data
+data/
+
+# Backtest outputs
+results/
