@@ -254,8 +254,9 @@ class FusionSniperBot:
             except Exception:
                 pass
 
-        # v5.0.0: simulated positions when in paper mode
+        # v5.0.0: simulated positions + realised-P&L ledger for paper mode
         self.paper_positions = {}
+        self.paper_closed_trades = []   # [{'time': datetime, 'net': float}] feeds daily/weekly caps
         
         # Logging
         self.logger.info("="*60)
@@ -760,6 +761,9 @@ class FusionSniperBot:
         self.logger.warning(
             f"[PAPER] Would CLOSE #{ticket} {direction} @ {exit_price} ({reason}) P&L {profit:.2f}"
         )
+        # v5.0.0: record realised paper P&L so it feeds the daily/weekly caps.
+        # (order_calc_profit is price-based; paper does not model commission/swap.)
+        self.paper_closed_trades.append({'time': datetime.now(), 'net': float(profit)})
         profit_pips = abs(exit_price - pos['price_open']) / self.pip_size
         if profit < 0:
             profit_pips = -profit_pips
@@ -1125,31 +1129,39 @@ class FusionSniperBot:
             broker_today_end = broker_today_start + timedelta(days=1) - timedelta(seconds=1)
             broker_now = min(now_local + timedelta(hours=broker_timezone_offset), broker_today_end)
                         
-            # Query MT5 with broker-adjusted times
-            deals = mt5.history_deals_get(broker_today_start, broker_now)
-            
-            if deals is None:
-                self.logger.debug("  No deals returned from MT5")
-                return self.daily_target_reached or self.loss_limit_pending or self.profit_target_pending
-            
-            # Calculate NET profit (only count exit deals to avoid double-counting)
-            total_profit = 0.0
-            total_commission = 0.0
-            total_swap = 0.0
-            
-            # Count ALL deals for commission, but only EXIT deals for profit
-            for deal in deals:
-                if deal.magic == self.magic_number:
-                    # Commission from all deals (entry + exit)
-                    total_commission += abs(deal.commission)
-                    
-                    # Only exit deals for profit/swap
-                    if deal.entry == mt5.DEAL_ENTRY_OUT:
-                        total_profit += deal.profit
-                        total_swap += deal.swap
-            
-            # NET profit = Gross profit - Commission + Swap
-            net_profit = total_profit - total_commission + total_swap
+            # v5.0.0: in PAPER mode there are no broker deals; accumulate realised NET
+            # P&L from closed SIMULATED positions (today, local date) so the SAME daily
+            # target / loss logic runs exactly as it would live.
+            if self.paper_mode:
+                today = now_local.date()
+                net_profit = sum(t['net'] for t in self.paper_closed_trades
+                                 if t['time'].date() == today)
+            else:
+                # Query MT5 with broker-adjusted times
+                deals = mt5.history_deals_get(broker_today_start, broker_now)
+
+                if deals is None:
+                    self.logger.debug("  No deals returned from MT5")
+                    return self.daily_target_reached or self.loss_limit_pending or self.profit_target_pending
+
+                # Calculate NET profit (only count exit deals to avoid double-counting)
+                total_profit = 0.0
+                total_commission = 0.0
+                total_swap = 0.0
+
+                # Count ALL deals for commission, but only EXIT deals for profit
+                for deal in deals:
+                    if deal.magic == self.magic_number:
+                        # Commission from all deals (entry + exit)
+                        total_commission += abs(deal.commission)
+
+                        # Only exit deals for profit/swap
+                        if deal.entry == mt5.DEAL_ENTRY_OUT:
+                            total_profit += deal.profit
+                            total_swap += deal.swap
+
+                # NET profit = Gross profit - Commission + Swap
+                net_profit = total_profit - total_commission + total_swap
 
             # Check if there are open positions for this bot on this symbol
             has_open_positions_for_bot = self._has_open_positions_for_bot()
@@ -1204,8 +1216,9 @@ class FusionSniperBot:
                 if net_profit <= -cap:
                     loss_breached = True
 
-                # CHECK 2. optional equity drawdown based
-                if self.config.get('RISK', {}).get('loss_limit_by_equity', True):
+                # CHECK 2. optional equity drawdown based (skipped in paper: real account
+                # equity does not reflect simulated trades, so realised paper net is authoritative)
+                if (not self.paper_mode) and self.config.get('RISK', {}).get('loss_limit_by_equity', True):
                     try:
                         account_info = mt5.account_info()
                         current_equity = float(account_info.equity)
@@ -1396,25 +1409,31 @@ class FusionSniperBot:
             if self.weekly_limit_triggered:
                 return True
 
-            # Pull deals for this week in broker time
-            deals = mt5.history_deals_get(broker_week_start, broker_now)
-            if deals is None:
-                self.logger.debug("No deals returned for weekly limits calculation")
-                return False
+            # v5.0.0: PAPER mode -> sum realised NET from closed simulated positions in
+            # this week instead of broker deals, so the weekly pause behaves as it would live.
+            if self.paper_mode:
+                net_weekly_profit = sum(t['net'] for t in self.paper_closed_trades
+                                        if t['time'].date() >= week_start_date)
+            else:
+                # Pull deals for this week in broker time
+                deals = mt5.history_deals_get(broker_week_start, broker_now)
+                if deals is None:
+                    self.logger.debug("No deals returned for weekly limits calculation")
+                    return False
 
-            total_profit = 0.0
-            total_commission = 0.0
-            total_swap = 0.0
+                total_profit = 0.0
+                total_commission = 0.0
+                total_swap = 0.0
 
-            # Count commission from all deals. profit or swap only from exit deals
-            for deal in deals:
-                if deal.magic == self.magic_number:
-                    total_commission += abs(deal.commission)
-                    if deal.entry == mt5.DEAL_ENTRY_OUT:
-                        total_profit += deal.profit
-                        total_swap += deal.swap
+                # Count commission from all deals. profit or swap only from exit deals
+                for deal in deals:
+                    if deal.magic == self.magic_number:
+                        total_commission += abs(deal.commission)
+                        if deal.entry == mt5.DEAL_ENTRY_OUT:
+                            total_profit += deal.profit
+                            total_swap += deal.swap
 
-            net_weekly_profit = total_profit - total_commission + total_swap
+                net_weekly_profit = total_profit - total_commission + total_swap
 
             weekly_loss_hit = max_weekly_loss > 0 and net_weekly_profit <= -max_weekly_loss
             weekly_profit_hit = max_weekly_profit > 0 and net_weekly_profit >= max_weekly_profit
