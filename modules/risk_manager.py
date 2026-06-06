@@ -1,5 +1,5 @@
 """
-Risk Manager - Fusion Sniper Bot
+Risk Manager - Fusion Sniper Bot v5.0.0
 Manages position sizing and risk parameters
 UPDATED: All settings now read from config.json
 """
@@ -23,7 +23,10 @@ class RiskManager:
         self.max_positions = risk_config.get('max_positions_per_bot', 1)
         
         # Confidence-based sizing (optional)
-        confidence_config = risk_config.get('confidence_based_sizing', {})
+        # v5.0.0 (M6): config key is 'confidence_based_scaling'. Accept the legacy
+        # 'confidence_based_sizing' name too so old configs still work.
+        confidence_config = risk_config.get('confidence_based_scaling',
+                                            risk_config.get('confidence_based_sizing', {}))
         self.use_confidence_sizing = confidence_config.get('enabled', False)
         self.min_confidence = confidence_config.get('min_confidence', 0.6)
         self.high_confidence_threshold = confidence_config.get('high_confidence_threshold', 0.8)
@@ -44,7 +47,13 @@ class RiskManager:
             self.logger.info(f"Confidence sizing: ENABLED (range: {self.confidence_min_multiplier}-{self.confidence_max_multiplier})")
     
     def can_trade(self) -> bool:
-        """Check if we can open new trades"""
+        """Check if we can open new trades.
+
+        v5.0.0 (H4): the daily-loss limit is NO LONGER enforced here. main_bot's
+        check_daily_profit() owns the authoritative daily P&L pause (NET, broker-time
+        window, plus equity drawdown). This method now only enforces the position
+        limit and the account drawdown, so the two systems can't disagree.
+        """
         try:
             # Check position limit
             positions = mt5.positions_get(symbol=self.symbol)
@@ -53,14 +62,9 @@ class RiskManager:
                 if len(my_positions) >= self.max_positions:
                     self.logger.debug(f"Position limit reached: {len(my_positions)}/{self.max_positions}")
                     return False
-            
-            # Check daily loss limit
-            if self.max_daily_loss > 0:
-                today_profit = self.get_daily_profit()
-                if today_profit < 0 and abs(today_profit) >= self.max_daily_loss:
-                    self.logger.warning(f"Daily loss limit reached: £{today_profit:.2f}")
-                    return False
-            
+
+            # NOTE: daily-loss enforcement intentionally removed here (see docstring).
+
             # Check drawdown
             account_info = mt5.account_info()
             if account_info:

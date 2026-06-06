@@ -1,5 +1,5 @@
 """
-Trade Statistics Tracker - Fusion Sniper Bot
+Trade Statistics Tracker - Fusion Sniper Bot v5.0.0
 Tracks and analyzes trading performance
 UPDATED: All settings now read from config.json
 """
@@ -8,7 +8,7 @@ import json
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict
 
 class TradeStatistics:
     """Track and analyze trade performance"""
@@ -25,11 +25,16 @@ class TradeStatistics:
         stats_config = config.get('STATISTICS', {})
         self.enabled = stats_config.get('enabled', True)
         
-        # Get stats file path from config (with symbol replacement)
-        stats_file_pattern = stats_config.get('log_file', 'logs/trade_statistics_{symbol}.json')
+        # Get stats file path from config (with symbol replacement).
+        # v5.0.0 (M6): config key is 'stats_file_path' (accept legacy 'log_file' too).
+        stats_file_pattern = stats_config.get('stats_file_path',
+                                              stats_config.get('log_file',
+                                                               'logs/trade_statistics_{symbol}.json'))
         self.stats_file = stats_file_pattern.replace('{symbol}', self.symbol)
-        
-        self.max_trades_history = stats_config.get('max_trades_history', 100)
+
+        # v5.0.0 (M6): config key is 'max_history' (accept legacy 'max_trades_history' too).
+        self.max_trades_history = stats_config.get('max_history',
+                                                   stats_config.get('max_trades_history', 100))
         
         # Tracking flags
         self.track_mae = stats_config.get('track_mae', True)

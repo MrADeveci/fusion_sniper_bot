@@ -1,5 +1,5 @@
 """
-Fusion Sniper - Telegram Notification Module v4.0
+Fusion Sniper - Telegram Notification Module v5.0.0
 Handles all Telegram message sending for trading bot notifications
 """
 
@@ -203,29 +203,18 @@ Status: <i>Active and monitoring</i>"""
         # Do nothing - break-even notifications disabled
         pass
     
-    def notify_trailing_activated(self, symbol, position_id, new_sl, current_price):
-        """
-        Notify when trailing stop is activated
-        
-        Args:
-            symbol (str): Trading pair
-            position_id (int): Position ticket
-            new_sl (float): New stop loss level
-            current_price (float): Current market price
-        """
-        timestamp = datetime.now().strftime("%I:%M:%S %p")
-        
-        message = f"""📈 <b>Trailing Stop Updated</b>
+    def notify_paper_mode(self, symbol):
+        """v5.0.0: announce that the bot is running in PAPER (dry-run) mode."""
+        timestamp = datetime.now().strftime("%d/%m/%Y %I:%M:%S %p")
+        message = f"""🧪 <b>PAPER MODE ACTIVE</b>
 
 📊 <b>Pair:</b> {symbol}
-🎫 <b>Position:</b> #{position_id}
-📍 <b>Current Price:</b> {current_price}
-🛡️ <b>New Stop Loss:</b> {new_sl}
+⚠️ <b>No real orders will be sent.</b> Orders and SL/TP changes are SIMULATED.
+⏰ <b>Time:</b> {timestamp}
 
-⏰ <b>Time:</b> {timestamp}"""
-        
+<i>This is a dry run. Do not confuse with live trading.</i>"""
         self.send_message(message)
-    
+
     def notify_daily_target_reached(self, symbol, daily_profit, target):
         """
         Notify when daily profit target is reached
@@ -384,198 +373,10 @@ Status: <i>Active and monitoring</i>"""
         
         self.send_message(message)
     
-    def send_daily_summary(self, all_pairs_data):
-        """
-        Send end-of-day performance summary for all pairs
-        
-        Args:
-            all_pairs_data (list): List of dicts with data for each pair
-                Each dict should contain:
-                - symbol (str)
-                - trades (int)
-                - wins (int)
-                - losses (int)
-                - profit (float)
-        """
-        timestamp = datetime.now().strftime("%d/%m/%Y %I:%M:%S %p")
-        
-        total_trades = sum(pair['trades'] for pair in all_pairs_data)
-        total_profit = sum(pair['profit'] for pair in all_pairs_data)
-        
-        # Build individual pair summaries
-        pair_summaries = []
-        for pair in all_pairs_data:
-            win_rate = (pair['wins'] / pair['trades'] * 100) if pair['trades'] > 0 else 0
-            profit_symbol = "+" if pair['profit'] >= 0 else ""
-            result_emoji = "✅" if pair['profit'] > 0 else "❌" if pair['profit'] < 0 else "⚪"
-            
-            pair_summaries.append(
-                f"{result_emoji} <b>{pair['symbol']}</b>: {pair['trades']} trades | "
-                f"{win_rate:.0f}% wins | {profit_symbol}£{pair['profit']:.2f}"
-            )
-        
-        pairs_text = "\n".join(pair_summaries)
-        
-        total_profit_symbol = "+" if total_profit >= 0 else ""
-        total_emoji = "🎉" if total_profit > 0 else "⚠️" if total_profit < 0 else "ℹ️"
-        
-        message = f"""{total_emoji} <b>Daily Summary</b>
+    # v5.0.0 (L4): removed unused notifiers send_daily_summary, notify_daily_progress,
+    # notify_trade_closed_with_progress, notify_target_reached, notify_midnight_reset,
+    # notify_friday_warning, notify_trailing_activated (none were called by the bot).
 
-📅 <b>Date:</b> {timestamp.split()[0]}
-⏰ <b>Report Time:</b> 10:00 PM UK
-
-<b>Performance by Pair:</b>
-{pairs_text}
-
-<b>Overall Results:</b>
-📊 <b>Total Trades:</b> {total_trades}
-💰 <b>Total P&L:</b> {total_profit_symbol}£{total_profit:.2f}
-
-<i>Ready for tomorrow's session!</i>"""
-        
-        self.send_message(message)
-    
-    # ========================================================================
-    # NEW METHODS FOR DAILY PROFIT MANAGER (v3.0.0)
-    # ========================================================================
-    
-    def notify_daily_progress(self, gross_profit, fees_paid, net_profit, target, percent_complete):
-        """
-        Send daily profit progress update
-        
-        Args:
-            gross_profit (float): Total gross profit
-            fees_paid (float): Total fees paid
-            net_profit (float): Net profit after fees
-            target (float): Daily target
-            percent_complete (float): Percentage of target reached
-        """
-        if not self.enabled:
-            return
-        
-        message = f"""
-💰 *Daily Profit Progress*
-
-Gross Profit: £{gross_profit:.2f}
-Broker Fees: £{fees_paid:.2f}
-━━━━━━━━━━━━━━━━
-NET Profit: £{net_profit:.2f}
-
-Target: £{target:.2f}
-Progress: {percent_complete:.1f}%
-Remaining: £{target - gross_profit:.2f}
-"""
-        self.send_message(message)
-    
-    def notify_trade_closed_with_progress(self, symbol, direction, lot_size, entry_price, 
-                                         exit_price, profit, reason, gross_profit, 
-                                         fees_paid, net_profit, target, percent_complete):
-        """
-        Enhanced trade closure notification with daily progress
-        
-        Args:
-            symbol, direction, lot_size, entry_price, exit_price, profit, reason: Trade details
-            gross_profit (float): Total gross profit today
-            fees_paid (float): Total fees paid today
-            net_profit (float): Net profit after fees today
-            target (float): Daily target
-            percent_complete (float): Percentage of target reached
-        """
-        if not self.enabled:
-            return
-        
-        # Determine emoji based on profit
-        emoji = "✅" if profit > 0 else "❌"
-        
-        message = f"""
-{emoji} *Trade Closed: {symbol}*
-
-Direction: {direction}
-Lot Size: {lot_size}
-Entry: {entry_price:.5f}
-Exit: {exit_price:.5f}
-Profit: £{profit:.2f}
-Reason: {reason}
-
-📊 *Daily Progress*
-Gross: £{gross_profit:.2f} | Fees: £{fees_paid:.2f}
-NET: £{net_profit:.2f} ({percent_complete:.1f}%)
-Remaining: £{target - gross_profit:.2f}
-"""
-        self.send_message(message)
-    
-    def notify_target_reached(self, gross_profit, fees_paid, net_profit, target, 
-                            trade_count, win_count, loss_count):
-        """
-        Notify when daily profit target is reached
-        
-        Args:
-            gross_profit (float): Total gross profit
-            fees_paid (float): Total fees paid
-            net_profit (float): Net profit after fees
-            target (float): Daily target
-            trade_count (int): Total trades today
-            win_count (int): Winning trades
-            loss_count (int): Losing trades
-        """
-        if not self.enabled:
-            return
-        
-        win_rate = (win_count / trade_count * 100) if trade_count > 0 else 0
-        
-        message = f"""
-🎯 *DAILY TARGET REACHED!* 🎯
-
-Gross Profit: £{gross_profit:.2f}
-Broker Fees: £{fees_paid:.2f}
-━━━━━━━━━━━━━━━━
-NET Profit: £{net_profit:.2f}
-
-Target: £{target:.2f}
-Achievement: {(gross_profit/target*100):.1f}%
-
-📈 *Performance*
-Total Trades: {trade_count}
-Wins: {win_count} | Losses: {loss_count}
-Win Rate: {win_rate:.1f}%
-
-✋ Trading paused until midnight reset
-"""
-        self.send_message(message)
-    
-    def notify_midnight_reset(self):
-        """Notify that daily profit tracking has been reset at midnight"""
-        if not self.enabled:
-            return
-        
-        message = """
-🌙 *Midnight Reset Complete*
-
-Daily profit tracking has been reset.
-Ready for a new trading day!
-
-Target: Check /daily for today's goal
-Status: Active and monitoring
-"""
-        self.send_message(message)
-    
-    def notify_friday_warning(self):
-        """Warn that Friday trading window is ending soon"""
-        if not self.enabled:
-            return
-        
-        message = """
-⚠️ *Friday Trading Window Closing*
-
-Market closes at 22:00 (10 PM) on Friday.
-
-No new trades will be opened after this time.
-Existing positions will be managed until close.
-
-Next trading window: Monday 01:00
-"""
-        self.send_message(message)
-    
     def notify_news_avoidance(self, news_event):
         """
         Notify when trading is paused due to news event
@@ -678,6 +479,6 @@ Markets open Monday 1am"""
 
 if __name__ == "__main__":
     # Test module
-    print("Fusion Sniper - Telegram Notifier Module v4.0")
+    print("Fusion Sniper - Telegram Notifier Module v5.0.0")
     print("This module handles all Telegram notifications")
     print("Import this into your main bot to use notifications")

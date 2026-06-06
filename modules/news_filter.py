@@ -1,16 +1,29 @@
 """
-Economic News Filter - Fusion Sniper Bot
+Economic News Filter - Fusion Sniper Bot v5.0.0
 Filters high-impact economic news to avoid volatile periods
 UPDATED: All settings now read from config.json - ForexFactory XML format
+
+v5.0.0 (H5): the ForexFactory feed publishes event times in its account timezone
+(default US Eastern), NOT UTC. We now localise parsed event times to that feed
+timezone, convert them to UTC, and compare everything in UTC. The feed timezone is
+configurable via NEWS_FILTER.feed_timezone (default 'America/New_York').
 """
 
 import requests
 import xml.etree.ElementTree as ET
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import json
 import time
+
+# zoneinfo (stdlib 3.9+) needs the IANA tz database. On Windows that comes from the
+# 'tzdata' PyPI package; if it is missing we fall back to a fixed UTC offset.
+try:
+    from zoneinfo import ZoneInfo
+    _HAVE_ZONEINFO = True
+except Exception:  # pragma: no cover
+    _HAVE_ZONEINFO = False
 
 class EconomicNewsFilter:
     """Filter high-impact economic news events"""
@@ -32,6 +45,24 @@ class EconomicNewsFilter:
         
         # Holiday-specific buffer (convert hours to minutes)
         self.holiday_buffer = news_config.get('holiday_buffer_hours', 12) * 60
+
+        # v5.0.0 (H5): feed timezone for the ForexFactory calendar (default US Eastern).
+        self.feed_timezone_name = news_config.get('feed_timezone', 'America/New_York')
+        self.feed_tz = None
+        self.feed_fixed_offset_hours = news_config.get('feed_utc_offset_hours', -5)
+        if _HAVE_ZONEINFO:
+            try:
+                self.feed_tz = ZoneInfo(self.feed_timezone_name)
+            except Exception as e:
+                self.logger.warning(
+                    f"Could not load timezone '{self.feed_timezone_name}' ({e}); "
+                    f"falling back to fixed UTC{self.feed_fixed_offset_hours:+d} (no DST)."
+                )
+        else:
+            self.logger.warning(
+                "zoneinfo/tzdata unavailable; using fixed "
+                f"UTC{self.feed_fixed_offset_hours:+d} for news feed (no DST)."
+            )
         
         # Cache settings from config
         self.cache_dir = Path(news_config.get('cache_directory', 'cache'))
@@ -55,6 +86,17 @@ class EconomicNewsFilter:
         self.logger.info(f"Monitored currencies: {self.monitored_currencies}")
         self.logger.info(f"Buffer: {self.buffer_before}min before, {self.buffer_after}min after")
     
+    def _feed_to_utc(self, naive_dt: datetime) -> datetime:
+        """v5.0.0 (H5): interpret a naive feed datetime in the feed timezone and
+        return a timezone-aware UTC datetime."""
+        if self.feed_tz is not None:
+            aware = naive_dt.replace(tzinfo=self.feed_tz)
+        else:
+            aware = naive_dt.replace(
+                tzinfo=timezone(timedelta(hours=self.feed_fixed_offset_hours))
+            )
+        return aware.astimezone(timezone.utc)
+
     def fetch_news(self) -> bool:
         """Fetch news from ForexFactory XML API with retry logic"""
         if not self.enabled:
@@ -99,13 +141,16 @@ class EconomicNewsFilter:
                             event_datetime = datetime.strptime(f"{date_str} 12:00PM", "%m-%d-%Y %I:%M%p")
                         else:
                             event_datetime = datetime.strptime(f"{date_str} {time_str}", "%m-%d-%Y %I:%M%p")
-                        
+
+                        # v5.0.0 (H5): feed time is in feed timezone -> convert to UTC
+                        event_datetime = self._feed_to_utc(event_datetime)
+
                         # Only track monitored currencies and impact levels
                         if country in self.monitored_currencies and impact in self.impact_levels:
                             self.events.append({
                                 'title': title,
                                 'currency': country,
-                                'time': event_datetime.isoformat(),
+                                'time': event_datetime.isoformat(),  # UTC, tz-aware ISO
                                 'impact': impact,
                                 'url': url
                             })
@@ -212,9 +257,9 @@ class EconomicNewsFilter:
             if time_since_fetch > self.check_interval:
                 self.fetch_news()
         
-        # Check upcoming events
-        now = datetime.now()
-        
+        # Check upcoming events (v5.0.0 H5: compare in UTC)
+        now = datetime.now(timezone.utc)
+
         for event in self.events:
             try:
                 event_time = datetime.fromisoformat(event['time'])
@@ -243,8 +288,8 @@ class EconomicNewsFilter:
         """Get upcoming events within specified hours"""
         if not self.enabled or not self.events:
             return []
-        
-        now = datetime.now()
+
+        now = datetime.now(timezone.utc)   # v5.0.0 (H5): UTC
         cutoff = now + timedelta(hours=hours_ahead)
         
         upcoming = []
