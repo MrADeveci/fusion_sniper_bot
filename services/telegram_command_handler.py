@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Telegram Command Handler - Fusion Sniper Bot (v4.0)
+Telegram Command Handler - Fusion Sniper Bot (v5.0.0)
 """
 
 import os
@@ -10,7 +10,7 @@ import time
 import logging
 import requests
 import subprocess
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 import MetaTrader5 as mt5
@@ -84,9 +84,15 @@ class TelegramCommandHandler:
         self.chat_id = self.config['TELEGRAM']['chat_id']
         self.last_update_id = 0
         
-        # API timeouts from config
+        # Pre-read nested config objects (v5.0.0 M6: use the keys the config actually has)
+        paths_cfg = handler_config.get('paths', {})
+        health_cfg = handler_config.get('health_thresholds', {})
+        display_cfg = handler_config.get('display', {})
+
+        # API timeouts from config (M6: config key is 'api_timeout_seconds')
         telegram_config = self.config.get('TELEGRAM', {})
-        self.api_timeout = telegram_config.get('api_timeout', 10)
+        self.api_timeout = telegram_config.get('api_timeout_seconds',
+                                               telegram_config.get('api_timeout', 10))
         self.long_poll_timeout = handler_config.get('long_poll_timeout', 30)
         self.long_poll_request_timeout = handler_config.get('long_poll_request_timeout', 35)
         
@@ -94,10 +100,12 @@ class TelegramCommandHandler:
         self.authorized_user_ids = telegram_config.get('authorized_user_ids', [])
         self.logger.info(f"Authorization: {len(self.authorized_user_ids)} authorized users")
 
-        # Bot control paths from config
+        # Bot control paths from config (M6: these live under TELEGRAM_HANDLER.paths)
         self.bot_dir = os.path.dirname(os.path.abspath(self.config_file))
-        self.status_file = Path(handler_config.get('bot_status_file', 'logs/bot_status.json'))
-        self.manual_stop_flag = Path(handler_config.get('manual_stop_flag_file', 'logs/manual_stop.flag'))
+        self.status_file = Path(paths_cfg.get('bot_status_file',
+                                              handler_config.get('bot_status_file', 'logs/bot_status.json')))
+        self.manual_stop_flag = Path(paths_cfg.get('manual_stop_flag',
+                                                   handler_config.get('manual_stop_flag_file', 'logs/manual_stop.flag')))
         
         # Bot control timeouts from config
         self.bot_startup_max_wait = handler_config.get('bot_startup_max_wait', 10)
@@ -109,29 +117,48 @@ class TelegramCommandHandler:
         # Trading thresholds from config
         self.close_position_deviation = handler_config.get('close_position_deviation', 20)
         
-        # Health check thresholds from config
-        self.log_active_threshold = handler_config.get('log_active_threshold_minutes', 5)
-        self.log_warning_threshold = handler_config.get('log_warning_threshold_minutes', 60)
-        self.margin_safe_level = handler_config.get('margin_safe_level', 500)
-        self.margin_warning_level = handler_config.get('margin_warning_level', 200)
-        
-        # Display settings from config
-        self.news_forecast_hours = handler_config.get('news_forecast_hours', 24)
-        self.max_news_events_display = handler_config.get('max_news_events_display', 5)
-        
+        # Health check thresholds from config (M6: under TELEGRAM_HANDLER.health_thresholds)
+        self.log_active_threshold = health_cfg.get('log_active_minutes',
+                                                   handler_config.get('log_active_threshold_minutes', 5))
+        self.log_warning_threshold = health_cfg.get('log_warning_minutes',
+                                                    handler_config.get('log_warning_threshold_minutes', 60))
+        self.margin_safe_level = health_cfg.get('margin_safe_level',
+                                                handler_config.get('margin_safe_level', 500))
+        self.margin_warning_level = health_cfg.get('margin_warning_level',
+                                                   handler_config.get('margin_warning_level', 200))
+
+        # Display settings from config (M6: under TELEGRAM_HANDLER.display)
+        self.news_forecast_hours = display_cfg.get('news_forecast_hours',
+                                                   handler_config.get('news_forecast_hours', 24))
+        self.max_news_events_display = display_cfg.get('max_news_events',
+                                                       handler_config.get('max_news_events_display', 5))
+
         # File paths from config - check both paths object and root level
-        paths_config = handler_config.get('paths', {})
-        self.trade_statistics_file = paths_config.get('trade_statistics_file', handler_config.get('trade_statistics_file', 'logs/trade_statistics_{symbol}.json'))
+        self.trade_statistics_file = paths_cfg.get('trade_statistics_file', handler_config.get('trade_statistics_file', 'logs/trade_statistics_{symbol}.json'))
         self.trade_statistics_file = self.trade_statistics_file.replace('{symbol}', self.symbol)
-        self.news_events_file = paths_config.get('news_events_file', handler_config.get('news_events_file', 'cache/news_events.json'))
-        
-        # Initialize MT5
-        if not mt5.initialize():
-            self.logger.error("MT5 initialization failed")
+        self.news_events_file = paths_cfg.get('news_events_file', handler_config.get('news_events_file', 'cache/news_events.json'))
+
+        # Initialize MT5 (M2: use the configured terminal path + login, like main_bot,
+        # so the handler reads the SAME account/terminal instead of a default one).
+        broker = self.config.get('BROKER', {})
+        mt5_path = broker.get('mt5_path')
+        init_ok = mt5.initialize(path=mt5_path) if mt5_path else mt5.initialize()
+        if not init_ok:
+            self.logger.error(f"MT5 initialization failed: {mt5.last_error()}")
             raise Exception("Cannot connect to MT5")
-        
-        self.logger.info(f"=================================")   
-        self.logger.info(f"=== Connected to MT5 {mt5.account_info().login} ===")
+        account = broker.get('account')
+        password = broker.get('password')
+        server = broker.get('server')
+        if account and password and server:
+            if not mt5.login(int(account), password=password, server=server):
+                self.logger.error(f"MT5 login failed: {mt5.last_error()}")
+                raise Exception("Cannot log in to MT5")
+
+        # M1: guard against account_info() returning None
+        acct = mt5.account_info()
+        acct_login = acct.login if acct is not None else "unknown"
+        self.logger.info(f"=================================")
+        self.logger.info(f"=== Connected to MT5 {acct_login} ===")
         self.logger.info(f"=== Telegram Command Handler  ===")
         self.logger.info(f"=== Built for : {self.symbol} Trades ===")
         self.logger.info(f"=================================")
@@ -290,10 +317,25 @@ class TelegramCommandHandler:
                 "📍 Leaving positions open and shutting down"
             )
             
-            positions_closed = 0  # Not closing positions on manual stop
             self._create_manual_stop_flag()
             self.logger.info("Created manual stop flag")
-            
+
+            # v5.0.0 (M11): prefer a GRACEFUL stop. main_bot watches the manual_stop
+            # flag and shuts down cleanly (saving state/stats). Wait briefly for it to
+            # exit on its own before falling back to a force-kill.
+            graceful_wait = 15
+            waited = 0
+            while waited < graceful_wait:
+                time.sleep(self.bot_startup_check_interval)
+                waited += self.bot_startup_check_interval
+                if not self._is_bot_running():
+                    return self.send_message(
+                        "✅ Bot stopped gracefully (clean shutdown).\n\n"
+                        "📍 Positions left open with their SL/TP.\n"
+                        "ℹ️ Use /start to launch again."
+                    )
+
+            self.logger.info("Graceful stop timed out; force-killing process tree")
             parent_cmd_pid = self._get_parent_cmd_process(bot_pid)
             
             if parent_cmd_pid:
@@ -468,7 +510,7 @@ class TelegramCommandHandler:
             
             # Check news filter (high-impact news blocking trades)
             # Note: We can't directly check news_filter from here, so we'll check log patterns
-            log_file = f"logs/{self.symbol.lower()}_bot.log"
+            log_file = f"logs/{self.symbol}_{datetime.now().strftime('%d%m%Y')}.log"  # v5.0.0 (M5): real rotated log name
             if os.path.exists(log_file):
                 # Read last few lines to check for news filter messages
                 try:
@@ -575,60 +617,9 @@ class TelegramCommandHandler:
             # Fail safe . treat hours as open so health does not incorrectly report outside hours
             return True
     
-    def _close_all_positions(self) -> int:
-        """Close all open positions before stopping bot"""
-        positions_closed = 0
-        
-        try:
-            positions = mt5.positions_get(symbol=self.symbol)
-            
-            if positions:
-                my_positions = [p for p in positions if p.magic == self.magic_number]
-                
-                for position in my_positions:
-                    try:
-                        order_type = mt5.ORDER_TYPE_SELL if position.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                        
-                        tick = mt5.symbol_info_tick(self.symbol)
-                        if not tick:
-                            self.logger.error(f"Failed to get tick for {self.symbol}")
-                            continue
-                        
-                        price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
-                        
-                        request = {
-                            "action": mt5.TRADE_ACTION_DEAL,
-                            "symbol": self.symbol,
-                            "volume": position.volume,
-                            "type": order_type,
-                            "position": position.ticket,
-                            "price": price,
-                            "deviation": self.close_position_deviation,
-                            "magic": self.magic_number,
-                            "comment": "Bot shutdown via /stop",
-                            "type_time": mt5.ORDER_TIME_GTC,
-                            "type_filling": mt5.ORDER_FILLING_IOC,
-                        }
-                        
-                        result = mt5.order_send(request)
-                        
-                        if result.retcode == mt5.TRADE_RETCODE_DONE:
-                            positions_closed += 1
-                            self.logger.info(f"Closed position #{position.ticket}")
-                        else:
-                            self.logger.error(f"Failed to close position #{position.ticket}: {result.comment}")
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error closing position #{position.ticket}: {str(e)}")
-                
-                if positions_closed > 0:
-                    time.sleep(self.process_wait_time)
-            
-        except Exception as e:
-            self.logger.error(f"Error closing positions: {str(e)}")
-        
-        return positions_closed
-    
+    # v5.0.0 (L4): removed unused _close_all_positions() (never called; /stop leaves
+    # positions open by design, and it had an unguarded result.retcode None-deref).
+
     def _get_bot_status_state(self):
         """
         Get detailed bot status state for /status command
@@ -649,7 +640,7 @@ class TelegramCommandHandler:
                 return "🟡", "Paused (Daily Target)"
             
             # Check for news avoidance by examining recent log entries
-            log_file = f"logs/{self.symbol.lower()}_bot.log"
+            log_file = f"logs/{self.symbol}_{datetime.now().strftime('%d%m%Y')}.log"  # v5.0.0 (M5): real rotated log name
             if os.path.exists(log_file):
                 try:
                     with open(log_file, 'r', encoding='utf-8', errors='ignore') as f:
@@ -976,7 +967,7 @@ MAE (Max Drawdown): £{avg_mae:.2f}
 MFE (Max Profit): £{avg_mfe:.2f}
 
 <b>Session Breakdown:</b>
-London: {sessions.get('London', 0)} | NY: {sessions.get('NewYork', 0)}
+Asia: {sessions.get('asia', 0)} | London: {sessions.get('london', 0)} | NY: {sessions.get('new_york', 0)}
 
 <b>Exit Reasons:</b>
 TP: {exit_reasons.get('take_profit', 0)} | SL: {exit_reasons.get('stop_loss', 0)}
@@ -999,17 +990,20 @@ Trail: {exit_reasons.get('trailing', 0)} | BE: {exit_reasons.get('breakeven', 0)
         
             with open(self.news_events_file, 'r') as f:
                 news_data = json.load(f)
-        
-            now = datetime.now()
-        
+
+            # v5.0.0 (H5): event times are stored in UTC (tz-aware); compare in UTC.
+            now = datetime.now(timezone.utc)
+
             # Show next 72 hours (3 days) - more useful than just today+tomorrow
             window_end = now + timedelta(hours=72)
             hours_ahead = 72
-        
+
             upcoming = []
-        
+
             for event in news_data.get('events', []):
                 event_time = datetime.fromisoformat(event['time'])
+                if event_time.tzinfo is None:        # tolerate legacy naive cache
+                    event_time = event_time.replace(tzinfo=timezone.utc)
                 # Show events from now until 72 hours ahead
                 if now <= event_time <= window_end:
                     upcoming.append(event)
