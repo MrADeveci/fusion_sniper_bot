@@ -38,6 +38,13 @@ KEY ASSUMPTIONS (affect absolute P&L, not the engine logic):
   - VPS wall clock (used by the live daily reset & session tag) assumed == UTC;
     server/CSV time = UTC + BROKER.broker_timezone_offset (2h)
 
+v5.0 ALIGNMENT: this engine mirrors two v5.0 live gates so edge tests reflect what
+will actually run:
+  - strict-bias DIRECTION match (M12): a BUY is only taken when structure bias is
+    BULL and a SELL only when bias is BEAR (not merely "bias is non-NEUTRAL").
+  - minimum stop-distance floor (O1): SL/TP are widened to at least
+    order_execution.min_stop_distance_usd (default 0.50) after the ATR stops are set.
+
 Run:
   python tools/backtest.py --start 2025-01-01 --end 2026-06-05
   python tools/backtest.py --validate            (Jan 12-22 2026, SMC off)
@@ -180,6 +187,8 @@ class Backtest:
         self.lot_size = float(t["lot_size"])
         self.max_positions = int(t.get("max_positions", 1))
         self.window = int(t.get("order_execution", {}).get("market_data_bars", 250))
+        # v5.0.0 (O1): minimum stop-distance floor (mirrors main_bot)
+        self.min_stop_floor = float(t.get("order_execution", {}).get("min_stop_distance_usd", 0.50))
 
         # exits
         self.use_be = bool(t.get("use_smart_breakeven", True))
@@ -277,6 +286,22 @@ class Backtest:
         # price move that yields scalp_target GBP of gross floating profit
         move = self.scalp_target * self.gbpusd / (CONTRACT_SIZE * lots)
         return entry + move if direction == "BUY" else entry - move
+
+    def _apply_stop_floor(self, entry, sl, tp, direction):
+        """v5.0.0 (O1): widen SL/TP so each is at least min_stop_floor from entry.
+        Mirrors main_bot._apply_stop_floor (trade_stops_level assumed 0 offline)."""
+        f = self.min_stop_floor
+        if direction == "BUY":
+            if (entry - sl) < f:
+                sl = entry - f
+            if (tp - entry) < f:
+                tp = entry + f
+        else:  # SELL
+            if (sl - entry) < f:
+                sl = entry + f
+            if (entry - tp) < f:
+                tp = entry - f
+        return sl, tp
 
     # ---- per-bar position management (mirrors manage_positions 1410-1515) ----
     def manage_bar(self, pos, bar, mode_is_scalp):
@@ -417,6 +442,7 @@ class Backtest:
                     entry = o[j]
                     atr = pending["atr"]
                     sl, tp = self.risk.calculate_atr_based_stops(entry, atr, pending["dir"])
+                    sl, tp = self._apply_stop_floor(entry, sl, tp, pending["dir"])  # v5.0.0 (O1)
                     if sl != 0 and tp != 0:
                         eu = self.utc(int(ep[j]))
                         open_positions.append({
@@ -524,6 +550,12 @@ class Backtest:
         signal = self.strategy.analyze(win, bias=self.last_market_bias)
         if not signal:
             return None
+
+        # v5.0.0 (M12): strict-bias DIRECTION match (BUY<->BULL, SELL<->BEAR)
+        if self.strict_bias:
+            want = "BULL" if signal["type"] == "BUY" else "BEAR"
+            if self.last_market_bias != want:
+                return None
 
         lots = position_size(signal, atr, self.cfg)
         mode = "scalp" if self._mode_is_scalp(eval_epoch, atr15, m15_close) else "normal"
