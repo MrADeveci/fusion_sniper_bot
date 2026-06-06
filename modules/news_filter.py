@@ -3,10 +3,12 @@ Economic News Filter - Fusion Sniper Bot v5.0.0
 Filters high-impact economic news to avoid volatile periods
 UPDATED: All settings now read from config.json - ForexFactory XML format
 
-v5.0.0 (H5): the ForexFactory feed publishes event times in its account timezone
-(default US Eastern), NOT UTC. We now localise parsed event times to that feed
-timezone, convert them to UTC, and compare everything in UTC. The feed timezone is
-configurable via NEWS_FILTER.feed_timezone (default 'America/New_York').
+v5.0.0 (H5): the ForexFactory weekly XML feed (nfs.faireconomy.media) publishes
+event times in UTC/GMT (fixed, no DST) -- verified empirically: NFP shows 12:30pm
+(= 8:30am ET / 12:30 UTC in EDT), ISM Manufacturing 2:00pm (= 10:00am ET / 14:00
+UTC), ADP 12:15pm (= 8:15am ET / 12:15 UTC). We localise parsed event times to the
+feed timezone, convert them to UTC, and compare everything in UTC. The feed
+timezone is configurable via NEWS_FILTER.feed_timezone (default 'UTC').
 """
 
 import requests
@@ -46,10 +48,10 @@ class EconomicNewsFilter:
         # Holiday-specific buffer (convert hours to minutes)
         self.holiday_buffer = news_config.get('holiday_buffer_hours', 12) * 60
 
-        # v5.0.0 (H5): feed timezone for the ForexFactory calendar (default US Eastern).
-        self.feed_timezone_name = news_config.get('feed_timezone', 'America/New_York')
+        # v5.0.0 (H5): feed timezone for the ForexFactory weekly XML (verified UTC).
+        self.feed_timezone_name = news_config.get('feed_timezone', 'UTC')
         self.feed_tz = None
-        self.feed_fixed_offset_hours = news_config.get('feed_utc_offset_hours', -5)
+        self.feed_fixed_offset_hours = news_config.get('feed_utc_offset_hours', 0)
         if _HAVE_ZONEINFO:
             try:
                 self.feed_tz = ZoneInfo(self.feed_timezone_name)
