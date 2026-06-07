@@ -65,6 +65,8 @@ coverage.xml
 # Exported market data
 data/
 
-# Backtest outputs
-results/
-results_*/
+# Backtest outputs (results/ and any results_* folder)
+results*/
+
+# Machine-specific launchers (keep local)
+*.bat
