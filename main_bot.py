@@ -743,6 +743,16 @@ class FusionSniperBot:
             return None  # query error / disconnect -- do NOT treat as flat
         return [p for p in positions if p.magic == self.magic_number]
 
+    def _sl_exit_reason(self, position):
+        """Label an SL-triggered exit. Momentum: 'Trail' if the stop was ratcheted away
+        from its original level (trailing exit), else 'Stop Loss hit'. SMC path is
+        unchanged (always 'Stop Loss hit')."""
+        if self.engine == 'momentum':
+            orig = getattr(position, 'orig_sl', None)
+            if orig is not None and abs(position.sl - orig) > (self.symbol_point / 2.0):
+                return "Trail"
+        return "Stop Loss hit"
+
     def _paper_check_sl_tp(self, position):
         """PAPER: simulate the broker closing a position on SL/TP touch."""
         tick = mt5.symbol_info_tick(self.symbol)
@@ -750,14 +760,14 @@ class FusionSniperBot:
             return False
         if position.type == 0:  # BUY -> exits on bid
             if position.sl > 0 and tick.bid <= position.sl:
-                self._close_paper_position(position.ticket, position.sl, "Stop Loss hit")
+                self._close_paper_position(position.ticket, position.sl, self._sl_exit_reason(position))
                 return True
             if position.tp > 0 and tick.bid >= position.tp:
                 self._close_paper_position(position.ticket, position.tp, "Take Profit hit")
                 return True
         else:  # SELL -> exits on ask
             if position.sl > 0 and tick.ask >= position.sl:
-                self._close_paper_position(position.ticket, position.sl, "Stop Loss hit")
+                self._close_paper_position(position.ticket, position.sl, self._sl_exit_reason(position))
                 return True
             if position.tp > 0 and tick.ask <= position.tp:
                 self._close_paper_position(position.ticket, position.tp, "Take Profit hit")
@@ -1597,6 +1607,11 @@ class FusionSniperBot:
                 reason = "Quick scalp profit"
             else:
                 reason = self.determine_close_reason(exit_price, pos_data['sl'], pos_data['tp'], direction)
+                # Momentum has no fixed TP, so a trailed-stop exit lands away from the
+                # original SL and would otherwise read as "Manual close": label it "Trail".
+                # (SMC labelling is untouched.)
+                if self.engine == 'momentum' and reason == "Manual close":
+                    reason = "Trail"
 
             self.telegram.notify_trade_closed(
                 symbol=self.symbol,
@@ -1798,7 +1813,7 @@ class FusionSniperBot:
                 )
                 self.paper_positions[ticket] = {
                     'ticket': ticket, 'type': 0 if order_type == 'BUY' else 1,
-                    'price_open': price, 'sl': sl, 'tp': tp, 'volume': volume,
+                    'price_open': price, 'sl': sl, 'orig_sl': sl, 'tp': tp, 'volume': volume,
                     'magic': self.magic_number, 'symbol': self.symbol,
                     'time': int(datetime.now().timestamp()), 'profit': 0.0,
                 }
