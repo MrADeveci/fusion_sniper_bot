@@ -67,3 +67,4 @@ data/
 
 # Backtest outputs
 results/
+results_*/
