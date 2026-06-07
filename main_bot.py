@@ -15,10 +15,12 @@ from types import SimpleNamespace
 
 import MetaTrader5 as mt5
 import numpy as np
+import pandas as pd
 
 
 # Import local modules
 from modules.strategy import FusionStrategy
+from modules.momentum_strategy import MomentumBreakoutStrategy
 from modules.risk_manager import RiskManager
 from modules.news_filter import EconomicNewsFilter
 from modules.telegram_notifier import TelegramNotifier
@@ -97,6 +99,23 @@ class FusionSniperBot:
         self.strict_bias = bool(
             smc_cfg.get('strict_bias', self.entry_timeframe_str != self.base_timeframe_str)
         )
+
+        # v5.0.0: strategy engine selector ("smc" | "momentum"). SMC path is unchanged.
+        self.engine = str(strategy_cfg.get('engine', 'smc')).lower()
+        self.momentum = None
+        if self.engine == 'momentum':
+            self.momentum = MomentumBreakoutStrategy(strategy_cfg.get('momentum', {}) or {})
+            # momentum runs M15 breakout entries with an H4 trend filter and M15 ATR
+            self.entry_timeframe_str, self.bias_timeframe_str, self.atr_timeframe_str = "M15", "H4", "M15"
+            self.entry_timeframe = getattr(mt5, "TIMEFRAME_M15")
+            self.bias_timeframe = getattr(mt5, "TIMEFRAME_H4")
+            self.atr_timeframe = getattr(mt5, "TIMEFRAME_M15")
+            self.timeframe = self.entry_timeframe
+            self.strict_bias = False  # momentum uses its own H4 trend filter
+            self.logger.info("Strategy engine: MOMENTUM breakout (entry M15 / bias H4 / ATR M15)")
+        else:
+            self.logger.info("Strategy engine: SMC")
+
         self.running = True
         
         # Trading parameters
@@ -1088,6 +1107,10 @@ class FusionSniperBot:
             if count == 0:
                 return True
 
+            # Momentum engine is strictly one position at a time (matches the backtest).
+            if self.engine == 'momentum':
+                return False
+
             if self.max_positions <= 1:
                 return False
 
@@ -1643,6 +1666,76 @@ class FusionSniperBot:
         except:
             return "Unknown"
     
+    def _generate_signal(self, bars_to_fetch):
+        """Return a signal dict (or None) from the active engine, gated on a newly closed
+        entry candle (one evaluation per closed entry bar). SMC path unchanged."""
+        entry_rates = self.get_market_data(
+            bars=bars_to_fetch,
+            timeframe=getattr(self, "entry_timeframe", self.timeframe),
+            closed_only=True,
+        )
+        if entry_rates is None:
+            return None
+        entry_bar_time = entry_rates[-1]['time']
+        if self.last_entry_bar_time == entry_bar_time:
+            return None  # not a new closed entry bar
+        self.last_entry_bar_time = entry_bar_time
+
+        bias_rates = self.get_market_data(
+            bars=max(250, bars_to_fetch),
+            timeframe=getattr(self, "bias_timeframe", self.timeframe),
+            closed_only=True,
+        )
+
+        # ---- Momentum engine (shared module) ----
+        if self.engine == 'momentum':
+            return self._momentum_signal(entry_rates, bias_rates)
+
+        # ---- SMC engine (unchanged) ----
+        if bias_rates is not None:
+            bias_bar_time = bias_rates[-1]['time']
+            if self.last_bias_bar_time != bias_bar_time:
+                self.last_bias_bar_time = bias_bar_time
+                try:
+                    bias_info = self.strategy.compute_structure_bias_from_rates(bias_rates)
+                    if isinstance(bias_info, dict):
+                        self.last_market_bias = bias_info.get('bias', 'NEUTRAL')
+                        self.last_bias_detail = bias_info
+                    else:
+                        self.last_market_bias = str(bias_info or 'NEUTRAL')
+                        self.last_bias_detail = {}
+                except Exception as e:
+                    self.logger.error(f"Error computing structure bias: {e}")
+                    self.last_market_bias = 'NEUTRAL'
+                    self.last_bias_detail = {}
+
+        signal = None
+        if (not self.strict_bias) or (self.last_market_bias in {'BULL', 'BEAR'}):
+            signal = self.strategy.analyze_from_rates(entry_rates, bias=self.last_market_bias)
+        else:
+            self.logger.info(f"[BIAS] {self.bias_timeframe_str} bias is NEUTRAL. skipping entries")
+
+        # v5.0.0 (M12): direction must match bias when strict_bias is on
+        if signal and self.strict_bias:
+            want = 'BULL' if signal['type'] == 'BUY' else 'BEAR'
+            if self.last_market_bias != want:
+                self.logger.info(
+                    f"[BIAS] {signal['type']} signal rejected: bias is {self.last_market_bias}, needs {want}")
+                signal = None
+        return signal
+
+    def _momentum_signal(self, entry_rates, bias_rates):
+        """Momentum engine: session-gated, H4-trend-filtered M15 breakout via the shared
+        MomentumBreakoutStrategy module. The VPS clock is UK local time, so datetime.now()
+        gives the UK hour used for the session filter."""
+        if not self.momentum.in_session(datetime.now().hour):
+            return None
+        if bias_rates is None or len(bias_rates) < 1:
+            return None
+        m15_df = pd.DataFrame(entry_rates)
+        h4_df = pd.DataFrame(bias_rates)
+        return self.momentum.signal(m15_df, h4_df)
+
     def open_trade(self, signal):
         """Execute trade with ATR-based stops and broker validation"""
         try:
@@ -1661,29 +1754,36 @@ class FusionSniperBot:
                 self.logger.warning("Cannot calculate ATR, skipping trade")
                 return False
             
-            # Calculate ATR-based stops
-            if order_type == 'BUY':
-                sl, tp = self.risk_manager.calculate_atr_based_stops(price, current_atr, 'BUY')
-                mt5_order_type = mt5.ORDER_TYPE_BUY
-            else:
-                sl, tp = self.risk_manager.calculate_atr_based_stops(price, current_atr, 'SELL')
-                mt5_order_type = mt5.ORDER_TYPE_SELL
-            
-            if sl == 0 or tp == 0:
-                self.logger.warning("RiskManager returned invalid stops")
-                return False
-            
-            # v5.0.0 (O1+H2): enforce minimum stop distance floor and round to digits
-            sl, tp = self._apply_stop_floor(price, sl, tp, order_type)
             price = self._round_price(price)
+            mt5_order_type = mt5.ORDER_TYPE_BUY if order_type == 'BUY' else mt5.ORDER_TYPE_SELL
 
-            # Validate with risk manager
-            if not self.risk_manager.validate_trade(order_type, price, sl, tp):
-                self.logger.warning("Risk manager validation failed")
-                return False
-
-            # v5.0.0 (H2): normalise volume to the symbol's step/min/max
-            volume = self._normalize_volume(self.lot_size)
+            if self.engine == 'momentum':
+                # Momentum: SL = sl_mult x ATR(M15), NO fixed TP; risk-based sizing (shared module)
+                sl = self.momentum.initial_stop(price, current_atr, order_type)
+                tp = 0.0
+                if (order_type == 'BUY' and sl >= price) or (order_type == 'SELL' and sl <= price):
+                    self.logger.warning("Momentum SL on wrong side of price; skipping")
+                    return False
+                acct = mt5.account_info()
+                equity = float(acct.equity) if acct is not None else None
+                risk_amt = self.momentum.risk_amount(equity)
+                volume = self.momentum.lots_for_risk(
+                    risk_amt, current_atr, contract_size=100.0,
+                    vol_step=self.volume_step, vol_min=self.volume_min, vol_max=self.volume_max)
+            else:
+                # SMC / default: ATR stops from RiskManager + O1 floor + validate + fixed lot
+                if order_type == 'BUY':
+                    sl, tp = self.risk_manager.calculate_atr_based_stops(price, current_atr, 'BUY')
+                else:
+                    sl, tp = self.risk_manager.calculate_atr_based_stops(price, current_atr, 'SELL')
+                if sl == 0 or tp == 0:
+                    self.logger.warning("RiskManager returned invalid stops")
+                    return False
+                sl, tp = self._apply_stop_floor(price, sl, tp, order_type)
+                if not self.risk_manager.validate_trade(order_type, price, sl, tp):
+                    self.logger.warning("Risk manager validation failed")
+                    return False
+                volume = self._normalize_volume(self.lot_size)
 
             symbol_info = mt5.symbol_info(self.symbol)
             spread = symbol_info.spread * symbol_info.point if symbol_info else 0
@@ -1774,6 +1874,22 @@ class FusionSniperBot:
                 # Update statistics
                 self.stats_tracker.update_trade({'current_profit': position.profit})
 
+                # ---- Momentum engine: trailing-only exit (shared module) ----
+                if self.engine == 'momentum':
+                    if self.paper_mode and self._paper_check_sl_tp(position):
+                        continue
+                    if position.ticket not in self.tracked_positions:
+                        continue
+                    pos_data = self.tracked_positions[position.ticket]
+                    entry_atr = pos_data.get('entry_atr', 0)
+                    if entry_atr == 0:
+                        entry_atr = self.calculate_atr() or 0
+                        pos_data['entry_atr'] = entry_atr
+                    if entry_atr > 0:
+                        self._manage_momentum(position, pos_data, entry_atr)
+                    continue
+
+                # ---- SMC / default exit management ----
                 # Quick scalp exit
                 if self.check_quick_profit_exit(position):
                     continue
@@ -1803,6 +1919,30 @@ class FusionSniperBot:
                     self.apply_chandelier_trailing(position, pos_data, entry_atr)
         except Exception as e:
             self.logger.error(f"Error managing positions: {e}")
+
+    def _manage_momentum(self, position, pos_data, entry_atr):
+        """Momentum exit: ratcheting ATR trailing stop only (no scalp, no breakeven),
+        using the shared MomentumBreakoutStrategy. Tracks the favourable extreme from the
+        current tick and moves the broker SL when the module says to."""
+        try:
+            tick = mt5.symbol_info_tick(self.symbol)
+            if tick is None:
+                return
+            cur = tick.bid if position.type == 0 else tick.ask
+            run_extreme = pos_data.get('run_extreme')
+            if run_extreme is None:
+                run_extreme = position.price_open
+            run_extreme = max(run_extreme, cur) if position.type == 0 else min(run_extreme, cur)
+            pos_data['run_extreme'] = run_extreme
+
+            direction = 'BUY' if position.type == 0 else 'SELL'
+            new_sl = self.momentum.update_trailing_stop(
+                direction, position.price_open, position.sl, run_extreme, entry_atr)
+            if abs(new_sl - position.sl) > (self.symbol_point / 2.0):
+                if self.modify_position(position.ticket, new_sl, position.tp):
+                    self.logger.info(f"Momentum trail: #{position.ticket} SL -> {new_sl}")
+        except Exception as e:
+            self.logger.error(f"Error in momentum management: {e}")
     
     def apply_atr_breakeven(self, position, pos_data, entry_atr):
         """Apply ATR-based break-even"""
@@ -2070,58 +2210,10 @@ class FusionSniperBot:
                             order_execution = self.config['TRADING'].get('order_execution', {})
                             bars_to_fetch = int(order_execution.get('market_data_bars', 250))
 
-                            signal = None
-                            entry_rates = self.get_market_data(
-                                bars=bars_to_fetch,
-                                timeframe=getattr(self, "entry_timeframe", self.timeframe),
-                                closed_only=True,
-                            )
-                            if entry_rates is not None:
-                                entry_bar_time = entry_rates[-1]['time']
-                                if self.last_entry_bar_time != entry_bar_time:
-                                    self.last_entry_bar_time = entry_bar_time
-
-                                    bias_rates = self.get_market_data(
-                                        bars=max(250, bars_to_fetch),
-                                        timeframe=getattr(self, "bias_timeframe", self.timeframe),
-                                        closed_only=True,
-                                    )
-                                    if bias_rates is not None:
-                                        bias_bar_time = bias_rates[-1]['time']
-                                        if self.last_bias_bar_time != bias_bar_time:
-                                            self.last_bias_bar_time = bias_bar_time
-                                            try:
-                                                bias_info = self.strategy.compute_structure_bias_from_rates(bias_rates)
-                                                if isinstance(bias_info, dict):
-                                                    self.last_market_bias = bias_info.get('bias', 'NEUTRAL')
-                                                    self.last_bias_detail = bias_info
-                                                else:
-                                                    self.last_market_bias = str(bias_info or 'NEUTRAL')
-                                                    self.last_bias_detail = {}
-                                            except Exception as e:
-                                                self.logger.error(f"Error computing structure bias: {e}")
-                                                self.last_market_bias = 'NEUTRAL'
-                                                self.last_bias_detail = {}
-
-                                    # Strict bias gate
-                                    if (not self.strict_bias) or (self.last_market_bias in {'BULL', 'BEAR'}):
-                                        signal = self.strategy.analyze_from_rates(entry_rates, bias=self.last_market_bias)
-                                    else:
-                                        self.logger.info(
-                                            f"[BIAS] {self.bias_timeframe_str} bias is NEUTRAL. skipping entries")
-
-                            # v5.0.0 (M12): require the signal direction to MATCH the
-                            # structure bias when strict_bias is on (BUY<->BULL, SELL<->BEAR).
-                            if signal and self.strict_bias:
-                                want = 'BULL' if signal['type'] == 'BUY' else 'BEAR'
-                                if self.last_market_bias != want:
-                                    self.logger.info(
-                                        f"[BIAS] {signal['type']} signal rejected: bias is "
-                                        f"{self.last_market_bias}, needs {want}")
-                                    signal = None
-
+                            signal = self._generate_signal(bars_to_fetch)
                             if signal:
-                                self.logger.info(f"Trade signal: {signal['type']} | bias={self.last_market_bias}")
+                                self.logger.info(
+                                    f"Trade signal: {signal['type']} | engine={self.engine}")
                                 self.open_trade(signal)
 
                     # Loop cadence
