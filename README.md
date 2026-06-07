@@ -1,635 +1,382 @@
-# Fusion Sniper Bot
+# Fusion Sniper Bot (v5.0)
 
-Automated trading bot for MetaTrader 5, written in Python.  
-Fusion Sniper is designed to run multiple symbols and accounts using separate instances.  
-It is currently tuned and used for:
+Automated MetaTrader 5 trading bot written in Python.
 
-- XAUUSD (Gold)
-- BTCUSD (Bitcoin)
-- EURUSD (Euro vs USD)
+The bot runs on Windows, connects directly to an MT5 terminal, evaluates a configurable
+strategy, manages risk, filters high impact economic news, and sends Telegram notifications
+and health updates.
 
-The bot runs on Windows, connects directly to MT5, applies a configurable technical strategy, manages risk, filters high impact economic news and sends rich Telegram notifications and health updates.
+The active focus is **XAUUSD (gold) on IC Markets**. The engine itself is symbol agnostic and
+has also been run on BTCUSD and EURUSD, but current development is gold only.
 
-> **Important**
+> **Important: credentials**
 >
-> The bot is driven by a `config.json` file that contains broker credentials and other sensitive data.  
-> Do **not** commit your live config file to GitHub.  
-> Keep your real `config.json` local and private and use an example file for documentation.
+> `config.json` holds live broker credentials and Telegram tokens. It must **never** be
+> committed. It is listed in `.gitignore`. Keep your real `config.json` local and use the
+> trimmed example in this document as a starting point, with placeholder values.
 
 ---
 
-## Features
+## Status and direction
 
-- Fully automated trading for XAUUSD and BTCUSD via separate instances
-- Config driven behaviour. most settings live in `config.json`
-- Technical strategy module with independent BUY and SELL conditions
-- ATR based stops with smart breakeven and Chandelier style trailing stop
-- Optional volatility detection and scalping mode based on ATR
-- Daily profit target and daily loss limit with automatic *pause* when hit
-- Centralised risk management and position sizing
-- High impact economic news filter using ForexFactory XML feed including Holiday events
-- Trade statistics tracking to JSON. win rate, best or worst trades and more
-- Telegram notification module for all key bot events
-- Telegram command handler service for remote control and health checks
-- Watchdog monitor that keeps the bot running and cleans up stale cache
-- Structured logging and status files suitable for external monitoring tools
+v5.0 is a reliability and correctness overhaul, not a strategy change. The strategy's edge is
+still being validated using an offline backtester and a paper trading mode. Run the bot on a
+demo account or in paper mode before any live use.
+
+This software is **not** claimed to be profitable or production proven. See the disclaimer at
+the end.
+
+---
+
+## Strategy
+
+**Live mode is SMC only** (`smc_only`):
+
+- A CHoCH style structure bias computed on the **M15** bias timeframe.
+- Fair Value Gap (FVG) rejection entries on the **M1** entry timeframe.
+- ATR taken from **M15** for stop and target sizing.
+- Entries require the signal direction to match the structure bias (v5.0 strict bias direction
+  match): a buy only when the bias is bullish, a sell only when bearish.
+
+The legacy indicator stack (EMA, RSI, ADX, Stochastic, Bollinger Bands) is retained as a
+fallback. It is used only when SMC is disabled and by the backtester. It is **not** used in the
+live `smc_only` configuration.
+
+---
+
+## Risk and trade management
+
+- ATR based stop loss and take profit.
+- Smart breakeven (move the stop to lock a small profit once price advances).
+- Chandelier style trailing stop.
+- Optional scalp/volatility mode driven by ATR.
+- Minimum stop distance floor (v5.0) so a very small ATR cannot create an over tight stop.
+- Daily profit target with an automatic pause once reached.
+- Daily and weekly loss caps, plus a maximum drawdown limit.
+- High impact economic news and holiday filter using the ForexFactory/faireconomy feed.
+
+---
+
+## What is new in v5.0
+
+- **Connection resilience:** MT5 connection loss is detected, with automatic reconnect and a
+  Telegram alert.
+- **Loop recovery:** the main loop recovers from transient errors instead of exiting. The
+  watchdog now restarts the bot from a cold start and survives its own errors.
+- **Robust order execution:** filling mode is selected from the symbol, volume is normalised to
+  the broker's step/min/max, SL/TP are rounded to tick size, sends use bounded retries, and the
+  deviation and order comment are read from config.
+- **No silent stop failures:** stop loss, breakeven and trailing modifications now log failures
+  and retry rather than failing silently.
+- **State persistence:** entry ATR, the breakeven flag and the cooldown clock persist across
+  restarts in `logs/bot_state.json`.
+- **News timezone fix:** the ForexFactory/faireconomy feed is published in UTC, and event times
+  are now parsed and compared in UTC.
+- **Reporting and config hygiene:** a single authoritative daily loss check, per trade reporting
+  now net of commission and swap, config keys aligned so documented settings take effect, and all
+  version strings unified to v5.0.
+- **Paper mode:** a new dry run mode (see below).
+
+---
+
+## Paper mode
+
+Paper mode runs the full live loop, connection, signal evaluation and position management, but
+simulates orders instead of sending them, so the bot can be shaken down against a live connection
+with no money at risk.
+
+Enable it in either of two ways:
+
+- Set `SYSTEM.paper_mode: true` in `config.json`, or
+- Pass the `--paper` flag on the command line.
+
+```bash
+python main_bot.py config.json --paper
+```
+
+Startup logs and a Telegram notice make paper mode unmistakable. Commission is not modelled in
+paper P&L, so paper results read slightly optimistic.
+
+---
+
+## Backtesting
+
+The bot ships with offline tooling for measuring expectancy and running out of sample
+(walk forward) tests. None of this connects to the broker for trading.
+
+- `tools/export_data.py` pulls historical XAUUSD M1 and M15 bars from the MT5 terminal into
+  `data/` (gitignored).
+- `tools/backtest.py` is an offline backtester that **reuses** the real strategy and risk modules
+  and mirrors the live gating and exits (including the strict bias direction match and the
+  minimum stop distance floor).
+
+```bash
+# 1) Export bars from the running, logged in MT5 terminal
+python tools/export_data.py
+
+# 2) Sanity check the engine over a short window
+python tools/backtest.py --validate
+
+# 3) A dated window, current live (smc_only) config
+python tools/backtest.py --start 2025-07-01 --end 2026-06-05
+
+# 4) Edge experiments
+python tools/backtest.py --start 2025-07-01 --end 2026-06-05 --no-scalp
+python tools/backtest.py --start 2025-07-01 --end 2026-06-05 --no-scalp --no-caps
+```
+
+`--no-scalp` removes the scalp quick profit cap, `--no-caps` removes the daily and weekly pause,
+and `--start`/`--end` set the window. Results are written to a `results/` folder (gitignored) and
+a gross and net summary is printed.
 
 ---
 
 ## Repository structure
 
-The repo contains the core trading engine, strategy and risk modules, Telegram services and some legacy components.
-
 ```text
 fusion_sniper_bot/
   main_bot.py
-  config.json           # local only. do not commit
+  config.json              # local only, gitignored
+  README.md
 
   modules/
-    __init__.py
-    strategy.py
-    risk_manager.py
-    news_filter.py
-    telegram_notifier.py
-    trade_statistics.py
+    strategy.py            # FusionStrategy: SMC + fallback indicator stack
+    risk_manager.py        # RiskManager: position limits, drawdown, stop sizing
+    news_filter.py         # EconomicNewsFilter: calendar based trading blocks
+    telegram_notifier.py   # TelegramNotifier: outbound messages
+    trade_statistics.py    # TradeStatistics: performance tracking to JSON
 
   services/
-    telegram_command_handler.py
-    watchdog_monitor.py
+    telegram_command_handler.py  # remote control and status commands
+    watchdog_monitor.py          # keeps the bot running, cleans stale cache
 
+  tools/
+    export_data.py         # pull MT5 history to data/
+    backtest.py            # offline backtester (reuses strategy + risk)
+
+  docs/
+    CODE_AUDIT.md          # v5.0 reliability/correctness audit
+
+  logs/                    # gitignored: logs, bot_status.json, bot_state.json
+  cache/                   # gitignored: news cache
+  data/                    # gitignored: exported bars
 ```
 
-- `main_bot.py` . main Fusion Sniper trading bot
-- `config.json` . local configuration file containing credentials, risk settings and behaviour flags
-- `modules/` . core functional modules
-  - `strategy.py` . `FusionStrategy` technical rules and signal generation
-  - `risk_manager.py` . `RiskManager` for position sizing and risk limits
-  - `news_filter.py` . `EconomicNewsFilter` for calendar based trading blocks
-  - `telegram_notifier.py` . `TelegramNotifier` for sending messages
-  - `trade_statistics.py` . `TradeStatistics` for performance tracking
-- `services/` . supporting long running services
-  - `telegram_command_handler.py` . `TelegramCommandHandler` for remote control
-  - `watchdog_monitor.py` . `WatchdogMonitor` to keep the bot healthy
+`config.json`, `logs/`, `cache/`, `data/` and `results/` are gitignored.
 
 ---
 
-## Main components
+## Configuration
 
-### `main_bot.py` . FusionSniperBot
-
-Main entry point and orchestration layer.
-
-- Connects to MetaTrader 5 via the `MetaTrader5` Python package
-- Loads and validates `config.json`
-- Sets up logging and writes a status file at `logs/bot_status.json`
-- Instantiates:
-  - `FusionStrategy` from `modules/strategy.py`
-  - `RiskManager` from `modules/risk_manager.py`
-  - `EconomicNewsFilter` from `modules/news_filter.py`
-  - `TradeStatistics` from `modules/trade_statistics.py`
-  - `TelegramNotifier` from `modules/telegram_notifier.py`
-- Core responsibilities:
-  - Pulls price data from MT5
-  - Builds pandas DataFrames for the strategy
-  - Evaluates BUY and SELL conditions independently
-  - Opens and manages positions subject to risk rules
-  - Applies ATR based stops, smart breakeven and trailing stop logic
-  - Enforces daily profit targets and daily loss limits including equity based checks
-  - Respects news and holiday blackout windows from `EconomicNewsFilter`
-  - Updates trade statistics and sends Telegram updates for key events
-
-### `modules/strategy.py` . FusionStrategy
-
-Technical analysis strategy module.
-
-- Uses the `ta` library for indicators:
-  - EMAs for trend and structure
-  - RSI
-  - Stochastic Oscillator
-  - ADX
-  - Bollinger Bands
-- Evaluates BUY and SELL blocks separately and returns:
-  - Signal direction (buy or sell or flat)
-  - Condition counts
-  - Textual reasoning details for logging or Telegram
-- Key configuration via `config["STRATEGY"]`:
-  - `min_conditions_required`
-  - EMA periods
-  - RSI overbought or oversold thresholds
-  - Stochastic and ADX thresholds
-  - Bollinger Band settings where applicable
-  - Additional technical analysis parameters such as swing detection and candle structure
-
-### `modules/risk_manager.py` . RiskManager
-
-Risk and money management module.
-
-- Uses MT5 account information to enforce:
-  - Maximum open positions per bot
-  - Maximum total volume or exposure per symbol
-  - Maximum daily loss in currency terms
-  - Maximum drawdown percentage based on equity or balance
-- Validates potential trades before entry:
-  - Position sizing rules
-  - Stop loss and take profit sanity checks relative to entry price
-- Reads configuration from `config["RISK"]` and supporting values from `config["TRADING"]`
-
-### `modules/news_filter.py` . EconomicNewsFilter
-
-High impact economic news and holiday filter. used to avoid trading during volatile periods and certain calendar events.
-
-- Fetches news from a ForexFactory XML feed defined in `config["NEWS_FILTER"]`
-- Filters by:
-  - Currency list. typically `["USD"]` for XAUUSD and BTCUSD CFDs
-  - Impact levels. for example `["High", "Holiday"]`
-  - Future time window around each event
-- Caches events to `cache/news_events.json` and reuses them when possible
-- Provides:
-  - Methods to check if trading is allowed at the current time
-  - A list of upcoming events and holidays within a chosen horizon for display in Telegram
-
-### `modules/trade_statistics.py` . TradeStatistics
-
-Tracks and persists historical performance to JSON.
-
-- Stores per trade information such as:
-  - Profit or loss
-  - Exit reason
-  - Order type
-  - Size
-- Maintains aggregate statistics including:
-  - Total trades
-  - Win and loss counts and win rate
-  - Total profit and loss
-  - Best and worst trade
-  - Streaks and exit reason breakdowns
-- The statistics file path and history length are read from the relevant section in `config.json`
-
-### `modules/telegram_notifier.py` . TelegramNotifier
-
-Thin wrapper around the Telegram Bot HTTP API using `requests`.
-
-- Sends HTML formatted or Markdown formatted messages to a configured chat
-- Used by `main_bot.py` to send:
-  - Startup and shutdown notifications
-  - New trade opened and closed
-  - Daily summaries
-  - Daily profit or loss limit alerts
-  - Error messages or warnings
-- Configuration comes from `config["TELEGRAM"]`:
-  - `bot_token`
-  - `chat_id`
-  - `enabled`
-
-### `services/telegram_command_handler.py` . TelegramCommandHandler
-
-Separate long running process that polls Telegram for commands and interacts with a single bot instance.
-
-- Reads the same `config.json` as the main bot in that folder
-- Uses:
-  - `config["BROKER"]` for symbol and magic number
-  - `config["TELEGRAM"]` for API credentials and authorised user IDs
-  - `config["TELEGRAM_HANDLER"]` for handler specific settings
-- Core functionality:
-  - Long polls the Telegram Bot API for updates
-  - Restricts access to `authorized_user_ids`
-  - Provides the following commands:
-    - `/start` . start the trading bot
-    - `/stop` . stop the trading bot
-    - `/news` . show upcoming news and holiday events
-    - `/status` . show current bot status and basic account information
-    - `/positions` . list current open positions relevant to the bot
-    - `/daily` . show daily performance summary and key statistics
-    - `/health` . show a combined health view including last heartbeat, margin levels and watchdog status
-  - Reads `logs/bot_status.json` and other files to determine the current bot state
-  - Can start or stop the main bot process using Windows commands
-- Intended to run alongside the bot on the same machine. one handler per instance or per account
-
-### `services/watchdog_monitor.py` . WatchdogMonitor
-
-Lightweight watchdog process that ensures the main bot stays healthy.
-
-- Reads its settings from `config["WATCHDOG"]` and `config["SYSTEM"]`
-- Regularly checks:
-  - Whether the main bot process is running. using the PID from `logs/bot_status.json`
-  - Whether the current time is within configured trading hours
-- If the bot is not running during trading hours and no manual stop flag is present:
-  - Automatically restarts the bot using `subprocess`
-- Cleans up old cache files such as stale news events
-- Windows specific. uses `tasklist` and `subprocess.CREATE_NO_WINDOW`
-
----
-
-## Requirements
-
-- Operating system. Windows. the MetaTrader 5 Python API and system commands are written with Windows in mind
-- Python. 3.9 or later recommended
-- MetaTrader 5 desktop terminal installed and logged in on the same machine
-- Python packages:
-  - `MetaTrader5`
-  - `numpy`
-  - `pandas`
-  - `ta` (technical analysis indicators)
-  - `requests`
-
-Install dependencies:
-
-```bash
-pip install MetaTrader5 numpy pandas ta requests
-```
-
-You may also want to create a virtual environment:
-
-```bash
-python -m venv .venv
-.\.venv\Scriptsctivate
-pip install -r requirements.txt  # if you add one
-```
-
----
-
-## Configuration . `config.json`
-
-The project relies on a `config.json` file placed alongside `main_bot.py` in the repo folder or in each runtime folder.
-
-This file is **not** committed to the repository because it contains live account details.  
-Add at least the following to your `.gitignore`:
-
-```text
-config.json
-logs/
-cache/
-```
-
-### Example structure for one instance
-
-The exact fields available are extensive. below is a trimmed example that shows the key sections and common options for a single symbol and account.  
-You would create one config per account or per symbol.
+Settings live in `config.json` alongside `main_bot.py`. The full key set is extensive; below is a
+trimmed, illustrative example showing the main sections and the new v5.0 keys. Replace every
+`xxxx` placeholder with your own values and never commit the real file.
 
 ```json
 {
-  "_comment": "Fusion Sniper Trading Bot - v4.2",
-  
+  "_comment": "Fusion Sniper Trading Bot - v5.0.0",
+
   "BROKER": {
     "account": xxxxxxxx,
-    "password": "xxxxxxxxx",
+    "password": "xxxxxxxx",
     "server": "ICMarketsSC-MT5-4",
     "symbol": "XAUUSD",
-    "magic_number": 000000,
-    "mt5_path": "C:\\fs_live_xauusd_11173822\\MT5\\terminal64.exe",
-    "timeout": 60000,
+    "magic_number": xxxxxx,
+    "mt5_path": "C:\\fs_live_xauusd_xxxxxxxx\\MT5\\terminal64.exe",
     "portable": true,
     "broker_timezone_offset": 2
   },
-  
+
   "TRADING": {
     "timeframe": "M15",
-    "lot_size": 0.7,
-
-    "_comment_positions": "Maximum Concurrent Positions",
+    "entry_timeframe": "M1",
+    "bias_timeframe": "M15",
+    "atr_timeframe": "M15",
+    "lot_size": 0.20,
     "max_positions": 2,
 
-    "_comment_stops": "Stop Loss & Take Profit Settings",
     "use_atr_based_stops": true,
     "stop_loss_atr_multiple": 0.4,
     "take_profit_atr_multiple": 2.0,
 
-    "_comment_breakeven": "Smart Break-Even Settings",
     "use_smart_breakeven": true,
     "breakeven_profit_multiple": 0.6,
     "breakeven_lock_profit_multiple": 0.3,
 
-    "_comment_trailing": "Trailing Stop Settings",
     "use_trailing_stop": true,
     "trailing_stop_type": "chandelier",
     "trailing_stop_atr_multiple": 2.0,
     "min_profit_for_trail_activation": 1.8,
 
-    "_comment_cooldown": "Trade Cooldown Settings",
-    "trade_cooldown_seconds": 60,
+    "daily_profit_target": 20,
 
-    "_comment_profit": "Daily Profit Target",
-    "daily_profit_target": 55,
-
-    "_comment_volatility": "Volatility Detection & Scalping",
     "volatility_detection": {
       "enabled": true,
       "atr_period": 14,
       "atr_scalp_threshold": 2.0,
-      "scalp_profit_target_gbp": 26.87,
-      "scalp_cooldown_seconds": 30,
-      "normal_cooldown_seconds": 60,
-
-      "_comment_limits": "ATR based risk limits",
+      "scalp_profit_target_gbp": 13.87,
       "skip_trading_when_atr_extreme": true,
       "atr_max_for_trading": 20.0
     },
 
-    "_comment_orders": "Order Execution Settings",
     "order_execution": {
       "deviation": 10,
-      "comment": "fusion_sniper_bot",
-      "scalp_comment": "scalp_quick_profit",
-      "emergency_rr_ratio": 2.0,
-      "tolerance_pips": 2,
-      "market_data_bars": 250
+      "comment": "fusion_sniper_v5",
+      "market_data_bars": 500,
+      "order_send_retries": 2,
+      "min_stop_distance_usd": 0.50
     },
 
-    "_comment_hours": "Trading Hours - UK time (Monday 01:00 - Friday 23:00, Sunday CLOSED)",
     "trading_hours": {
       "saturday_closed": true,
       "sunday_closed": true,
       "monday_open_hour": 1,
-      "sunday_open_hour": 23,
       "friday_close_hour": 23
     }
   },
 
   "RISK": {
-    "_comment_daily": "Daily loss protection in account currency",
-    "max_risk_per_trade": 1.5,
-    "max_daily_loss": 150,
+    "max_daily_loss": 60,
     "max_daily_loss_currency": "GBP",
     "loss_limit_by_equity": true,
-
-    "_comment_weekly": "Weekly NET P&L caps in account currency. closed trades + swap - commission",
     "weekly_limits_enabled": true,
-    "max_weekly_profit": 150,
-    "max_weekly_loss": 175,
+    "max_weekly_profit": 65,
+    "max_weekly_loss": 0,
     "week_start_day": "monday",
-
-    "max_drawdown_percent": 10.0,
-    "max_positions_per_bot": 2,
-
-    "_comment_confidence": "Confidence-Based Position Sizing",
-    "confidence_based_scaling": {
-      "enabled": false,
-      "min_confidence": 0.6,
-      "high_confidence_threshold": 0.8,
-      "scaling_range": {
-        "min_multiplier": 0.5,
-        "max_multiplier": 1.0
-      }
-    }
+    "max_drawdown_percent": 7.5,
+    "max_positions_per_bot": 2
   },
 
   "STRATEGY": {
-    "_comment_ema": "EMA Settings",
-    "ema_20_period": 20,
-    "ema_50_period": 50,
-    "ema_100_period": 100,
-    "ema_200_period": 200,
-
-    "_comment_rsi": "RSI Settings",
-    "rsi_period": 14,
-    "rsi_oversold": 40,
-    "rsi_overbought": 60,
-
-    "_comment_atr": "ATR Settings",
-    "atr_period": 14,
-    "atr_multiplier": 1.5,
-
-    "_comment_macd": "MACD Settings",
-    "macd_fast_period": 12,
-    "macd_slow_period": 26,
-    "macd_signal_period": 9,
-
-    "_comment_bb": "Bollinger Bands Settings",
-    "bb_period": 20,
-    "bb_std_dev": 2,
-
-    "_comment_conditions": "Signal Generation - Minimum conditions required for trade entry",
     "min_conditions_required": 4,
-    "debug_signals": false,
 
-    "_comment_technical": "Technical Analysis Parameters",
-    "technical_analysis": {
-      "swing_detection_threshold": 0.0015,
-      "candle_body_ratio": 0.6,
-      "exhaustion_wick_ratio": 2.0,
-      "breakout_volume_threshold": 1.5,
-      "support_resistance_tolerance": 0.0005,
-      "min_distance_from_sr": 0.001
-    },
-
-    "_comment_trend": "Trend Filter Parameters",
-    "trend_filter": {
+    "_comment_smc": "Live SMC settings (smc_only)",
+    "SMC": {
       "enabled": true,
-      "scope": "window",
-      "window": { "weekday": 3, "start_hour": 0, "end_hour": 8 },
-      "require_trend_flag": true,
-      "buy_extra_conditions": 0,
-      "sell_extra_conditions": 1
+      "smc_only": true,
+      "strict_bias": true,
+      "persist_bias": true,
+      "fractal_left_right": 2,
+      "use_fvg_entries": true,
+      "fvg_max_age_bars": 40,
+      "fvg_min_size_atr_mult": 0.15,
+      "fvg_rejection_wick_ratio": 0.5,
+      "fvg_require_candle_direction": true
     }
   },
 
   "TELEGRAM": {
-    "bot_token": "00000000000000000000000000000",
-    "chat_id": "00000000000000",
-    "authorized_user_ids": ["00000000000"],
+    "bot_token": "xxxxxxxx",
+    "chat_id": "xxxxxxxx",
+    "authorized_user_ids": ["xxxxxxxx"],
     "enabled": true,
-
-    "_comment_api": "Telegram API Settings",
     "api_timeout_seconds": 10
-  },
-
-  "TELEGRAM_HANDLER": {
-    "_comment": "Telegram command handler settings",
-
-    "_comment_paths": "File Paths",
-    "paths": {
-      "log_file": "logs/telegram_handler.log",
-      "bot_status_file": "logs/bot_status.json",
-      "manual_stop_flag": "logs/manual_stop.flag",
-      "trade_statistics_file": "logs/trade_statistics_{symbol}.json",
-      "news_events_file": "cache/news_events.json",
-      "log_directory": "logs"
-    },
-
-    "_comment_timeouts": "Timeouts and Intervals",
-    "command_timeout_seconds": 30,
-
-    "_comment_intervals": "Check Intervals",
-    "intervals": {
-      "bot_startup_check": 1,
-      "process_wait": 2
-    },
-
-    "_comment_health": "Health Check Thresholds",
-    "health_thresholds": {
-      "log_active_minutes": 5,
-      "log_warning_minutes": 60,
-      "margin_safe_level": 500,
-      "margin_warning_level": 200
-    },
-
-    "_comment_display": "Display Settings",
-    "display": {
-      "news_forecast_hours": 24,
-      "max_news_events": 5
-    }
   },
 
   "NEWS_FILTER": {
     "enabled": true,
     "api_url": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+    "feed_timezone": "UTC",
     "buffer_before_minutes": 30,
     "buffer_after_minutes": 30,
-    "check_interval_seconds": 300,
     "impact_levels": ["High", "Holiday"],
-    "monitored_currencies": ["USD"],
-
-    "_comment_notifications": "News Notification Settings",
-    "notify_on_news_avoidance": true,
-
-    "_comment_weekly": "Weekly Planning Summary (Sunday before market open)",
-    "weekly_summary_enabled": true,
-    "weekly_summary_day": 6,
-    "weekly_summary_hour_gmt": 22,
-    "holiday_buffer_hours": 12,
-
-    "_comment_cache": "Cache Settings",
-    "cache_directory": "cache",
-    "cache_max_age_minutes": 10,
-    "cache_file": "cache/news_events.json",
-    "cache_validity_hours": 6,
-    "cache_retention_days": 7,
-    "api_timeout_seconds": 10,
-
-    "_comment_retry": "Retry Logic",
-    "max_retries": 3,
-    "retry_delay_seconds": 2
-  },
-
-  "STATISTICS": {
-    "enabled": true,
-    "stats_file_path": "logs/trade_statistics_{symbol}.json",
-    "max_history": 100,
-
-    "_comment_tracking": "What to Track",
-    "track_mae": true,
-    "track_mfe": true,
-    "track_session_performance": true,
-    "track_exit_reasons": true
-  },
-
-  "WATCHDOG": {
-    "_comment": "Watchdog monitor settings",
-    "check_interval_seconds": 300,
-
-    "_comment_hours": "Trading Hours - UK time (Monday 01:00 - Friday 23:00, Sunday CLOSED)",
-    "trading_hours": {
-      "saturday_closed": true,
-      "sunday_closed": true,
-      "monday_open_hour": 1,
-      "sunday_open_hour": 23,
-      "friday_close_hour": 23
-    },
-
-    "_comment_cache": "Cache Retention",
-    "cache_retention_hours": 168
+    "monitored_currencies": ["USD"]
   },
 
   "SYSTEM": {
-    "_comment": "System-wide settings",
-    "_comment_paths": "File Paths",
+    "paper_mode": false,
     "log_directory": "logs",
-    "bot_status_file": "logs/bot_status.json",
-
-    "_comment_logging": "Logging Configuration",
-    "log_format": "%(asctime)s - %(levelname)s - %(message)s",
-    "log_retention_days": 7,
-
-    "_comment_timing": "Loop Timing (seconds)",
-    "main_loop_interval": 1,
-    "paused_loop_interval": 300,
-    "idle_sleep_interval": 60,
+    "main_loop_interval": 30,
+    "active_loop_interval": 1,
+    "paused_loop_interval": 120,
     "waiting_log_interval": 300
   }
 }
 ```
 
-For BTC you would use a separate config with:
-
-- `"symbol": "BTCUSD"` (or your broker’s exact symbol)
-- A different `magic_number`
-- BTC specific risk and trading parameters
-- A separate Telegram bot token and chat id if you want per account isolation
+The example omits the legacy indicator keys (EMA/RSI/ADX/Stochastic/Bollinger), the
+`TELEGRAM_HANDLER`, `WATCHDOG` and `STATISTICS` sections, and several other options. The complete,
+authoritative key set lives in `config.json`.
 
 ---
 
-## Running the bot
+## Requirements
+
+- Windows. The MT5 Python API and the process control commands are written for Windows.
+- An MT5 desktop terminal installed and logged in on the same machine.
+- Python 3.11 or later.
+- Python packages: `MetaTrader5`, `numpy`, `pandas`, `ta`, `requests`, and `tzdata` (provides the
+  timezone database used by the standard library `zoneinfo` for the news filter).
+
+```bash
+pip install MetaTrader5 numpy pandas ta requests tzdata
+```
+
+---
+
+## Running
+
+The MT5 terminal for the account must be open and logged in first.
 
 ### Single instance
 
-From the project folder (or from a dedicated runtime folder that contains `main_bot.py` and `config.json`):
+From a folder that contains `main_bot.py` and `config.json`:
 
 ```bash
+# Live
 python main_bot.py config.json
+
+# Paper / dry run (no orders sent)
+python main_bot.py config.json --paper
 ```
 
-In parallel run the Telegram command handler:
+In parallel, run the Telegram command handler and, optionally, the watchdog:
 
 ```bash
 python services/telegram_command_handler.py
+python services/watchdog_monitor.py config.json
 ```
 
-And optionally the watchdog:
+Telegram commands include `/start`, `/stop`, `/status`, `/positions`, `/daily`, `/health` and
+`/news`. Access is restricted to `authorized_user_ids`.
 
-```bash
-python services/watchdog_monitor.py
-```
+### Multi instance layout
 
-In practice many users create a small `.bat` file that opens a Windows Terminal window with three tabs:
-
-- Bot
-- Telegram handler
-- Watchdog
-
-All pointed at the same folder.
-
-### Multi instance layout. XAUUSD and BTCUSD
-
-A common layout for running multiple accounts or symbols is:
+Each symbol or account runs as its own runtime folder with its own MT5 terminal, config, magic
+number and Telegram bot:
 
 ```text
-C:\fusion_sniper_bot\                    # main codebase linked to GitHub
-
-C:\fs_live_xauusd_00000001\       # XAUUSD instance for account 00000001
-  MT5\                                   # portable MT5 for that account
+C:\fs_live_xauusd_xxxxxxxx\
+  MT5\                     # portable MT5 for that account
   main_bot.py
-  config.json                            # XAU config
-  modules  services  logs
-C:\fs_live_btcusd_00000002\        # BTCUSD instance for account 00000002
-  MT5\                                   # portable MT5 for that account
-  main_bot.py
-  config.json                            # BTC config
-  modules  services  logs```
+  config.json              # this account's config (gitignored)
+  modules\  services\  tools\  logs\
+```
 
-Workflow.
-
-- Develop and version control the code in `C:\fusion_sniper_bot`
-- When you are happy with a version. copy updated Python files into each runtime folder without overwriting:
-  - `config.json`
-  - `MT5\`
-  - `logs\`
-- Each runtime folder is started with its own `.bat` script that:
-  - launches the local MT5 in portable mode
-  - starts `main_bot.py`
-  - starts `telegram_command_handler.py`
-  - starts `watchdog_monitor.py`
-
-Each instance reads its own config, connects to its own MT5 terminal and uses its own Telegram bot.
+Each instance reads its own config, connects to its own MT5 terminal and uses its own magic
+number so the instances do not interfere with each other.
 
 ---
 
-## Safety and testing
+## Development workflow
 
-- Always start on a demo account and keep position sizes small until you trust the behaviour
-- Ensure `magic_number` values are unique per instance so bots do not interfere with each other’s trades
-- Double check `TRADING` and `RISK` settings whenever you clone a config for a new account or symbol
-- Watch the logs and Telegram messages closely for the first few days of any new deployment
+- Develop in a dev clone (for example `C:\fusion_sniper_bot`) that is separate from the live
+  runtime folder (for example `C:\fs_live_xauusd_<account>`).
+- Never edit code in the live folder while the bot is running.
+- Make changes on a branch, review the diff, then merge.
+- Version scheme: 5.0 is the baseline. Small fixes increment to 5.1, 5.2 and so on. A major
+  structural change moves to 6.0.
 
-Fusion Sniper is designed to be heavily config driven.  
-Most strategy, risk and timing changes can be made in `config.json` without editing Python code.  
-Use that to your advantage when tuning XAUUSD and BTCUSD separately.
+---
+
+## Safety and disclaimer
+
+- Always test on a demo account or in paper mode first.
+- Start with minimal position size and watch the logs and Telegram messages closely.
+- Keep `magic_number` unique per instance so bots do not act on each other's trades.
+- Re-check the `TRADING` and `RISK` sections whenever you clone a config for a new account or
+  symbol.
+
+Trading carries a significant risk of loss. This software is provided as is, with no guarantee of
+profit and no warranty of any kind. Nothing here is financial advice. You are responsible for any
+use of it on a live account.
