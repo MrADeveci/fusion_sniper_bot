@@ -288,34 +288,54 @@ class FusionSniperBot:
             self.logger.warning("### order_send / modify_position are SIMULATED        ###")
             self.logger.warning("#" * 60)
         self.logger.info(f"Magic number: {self.magic_number}")
-        self.logger.info(f"Lot size: {self.lot_size}")
-        self.logger.info(f"Max Concurrent Positions: {self.max_positions}")
-        self.logger.info("Stop/TP Mode: ATR-Based (Dynamic)")
-        self.logger.info(f"  SL Multiplier: {self.config['TRADING'].get('stop_loss_atr_multiple', 1.0)}x ATR")
-        self.logger.info(f"  TP Multiplier: {self.config['TRADING'].get('take_profit_atr_multiple', 2.0)}x ATR")
-        
-        # Log break-even settings
-        if self.use_breakeven:
-            self.logger.info("Break-Even: ENABLED (ATR-based)")
-            self.logger.info(f"  Trigger: {self.breakeven_trigger_multiple}x ATR profit")
-            self.logger.info(f"  Lock: {self.breakeven_lock_multiple}x ATR profit")
-        
-        # Log trailing stop settings
-        if self.use_trailing_stop:
-            self.logger.info(f"Trailing Stop: {self.trailing_stop_type.upper()} (ATR-based)")
-            self.logger.info(f"  Distance: {self.trailing_atr_multiple}x ATR")
-            self.logger.info(f"  Activation: {self.trail_activation_multiple}x ATR profit")
-        
-        if self.daily_profit_target > 0:
-            self.logger.info(f"Daily Profit Target: £{self.daily_profit_target} (PAUSE mode)")
-        
-        if self.volatility_enabled:
-            self.logger.info("="*50)
-            self.logger.info("AUTO-VOLATILITY DETECTION ENABLED")
-            self.logger.info(f"Scalp threshold: ATR > {self.atr_scalp_threshold}")
-            self.logger.info(f"Scalp target: £{self.scalp_profit_target}")
-            self.logger.info("="*50)
-        
+
+        if self.engine == 'momentum':
+            # Momentum engine: report the REAL validated params (shared module), not the
+            # legacy SMC ATR/scalp/breakeven settings which this engine does not use.
+            m = self.momentum
+            self.logger.info("Strategy: MOMENTUM breakout (H4-trend-filtered M15 breakout)")
+            self.logger.info(f"  H4 Trend Filter: EMA{m.h4_ema} (close > EMA => longs, < EMA => shorts)")
+            self.logger.info(f"  Entry: M15 close breaks prior-{m.lookback}-bar high/low in trend direction")
+            self.logger.info(f"  Stop Loss: {m.sl_mult}x ATR(M15)")
+            self.logger.info("  Take Profit: NONE (ratcheting trailing-stop exit only)")
+            self.logger.info(f"  Trailing Stop: {m.trail_mult}x ATR, activates at {m.trail_act}x ATR profit")
+            self.logger.info("  Scalp / Break-Even: DISABLED")
+            self.logger.info(f"  Session: {m.sess_start:02d}:00-{m.sess_end:02d}:00 UK | one position at a time")
+            if m.sizing_mode == 'percent_equity':
+                self.logger.info(f"  Sizing: {m.sizing_mode} | {m.risk_percent}% equity risk per trade")
+            else:
+                self.logger.info(f"  Sizing: {m.sizing_mode} | £{m.risk_flat_gbp:.0f} risk per trade")
+            if self.daily_profit_target > 0:
+                self.logger.info(f"Daily Profit Target: £{self.daily_profit_target} (PAUSE mode)")
+        else:
+            self.logger.info(f"Lot size: {self.lot_size}")
+            self.logger.info(f"Max Concurrent Positions: {self.max_positions}")
+            self.logger.info("Stop/TP Mode: ATR-Based (Dynamic)")
+            self.logger.info(f"  SL Multiplier: {self.config['TRADING'].get('stop_loss_atr_multiple', 1.0)}x ATR")
+            self.logger.info(f"  TP Multiplier: {self.config['TRADING'].get('take_profit_atr_multiple', 2.0)}x ATR")
+
+            # Log break-even settings
+            if self.use_breakeven:
+                self.logger.info("Break-Even: ENABLED (ATR-based)")
+                self.logger.info(f"  Trigger: {self.breakeven_trigger_multiple}x ATR profit")
+                self.logger.info(f"  Lock: {self.breakeven_lock_multiple}x ATR profit")
+
+            # Log trailing stop settings
+            if self.use_trailing_stop:
+                self.logger.info(f"Trailing Stop: {self.trailing_stop_type.upper()} (ATR-based)")
+                self.logger.info(f"  Distance: {self.trailing_atr_multiple}x ATR")
+                self.logger.info(f"  Activation: {self.trail_activation_multiple}x ATR profit")
+
+            if self.daily_profit_target > 0:
+                self.logger.info(f"Daily Profit Target: £{self.daily_profit_target} (PAUSE mode)")
+
+            if self.volatility_enabled:
+                self.logger.info("="*50)
+                self.logger.info("AUTO-VOLATILITY DETECTION ENABLED")
+                self.logger.info(f"Scalp threshold: ATR > {self.atr_scalp_threshold}")
+                self.logger.info(f"Scalp target: £{self.scalp_profit_target}")
+                self.logger.info("="*50)
+
         self.logger.info("News Filter: ENABLED (ForexFactory XML format)")
         self.logger.info("News Fetch: Continuous (even when paused)")
         
@@ -1743,13 +1763,33 @@ class FusionSniperBot:
         """Momentum engine: session-gated, H4-trend-filtered M15 breakout via the shared
         MomentumBreakoutStrategy module. The VPS clock is UK local time, so datetime.now()
         gives the UK hour used for the session filter."""
-        if not self.momentum.in_session(datetime.now().hour):
-            return None
-        if bias_rates is None or len(bias_rates) < 1:
-            return None
+        in_session = self.momentum.in_session(datetime.now().hour)
         m15_df = pd.DataFrame(entry_rates)
-        h4_df = pd.DataFrame(bias_rates)
-        return self.momentum.signal(m15_df, h4_df)
+        h4_df = pd.DataFrame(bias_rates) if bias_rates is not None else None
+
+        # Diagnostics (mirror MomentumBreakoutStrategy.signal internals so the log line
+        # shows exactly the inputs behind the decision). Runs once per new M15 bar.
+        lookback = self.momentum.lookback
+        trend = self.momentum.compute_h4_trend(h4_df) if h4_df is not None else 0
+        close = float(m15_df["close"].iloc[-1]) if len(m15_df) else float("nan")
+        if len(m15_df) >= lookback + 1:
+            prior = m15_df.iloc[-(lookback + 1):-1]
+            prior_high = float(prior["high"].max())
+            prior_low = float(prior["low"].min())
+        else:
+            prior_high = prior_low = float("nan")
+
+        # Only produce a tradable signal inside the session with valid bias data;
+        # the shared module stays the single source of truth for the decision.
+        signal = None
+        if in_session and h4_df is not None and len(h4_df) >= 1:
+            signal = self.momentum.signal(m15_df, h4_df)
+        direction = signal["type"] if signal else None
+
+        self.logger.info(
+            f"[MOM] session={in_session} trend={trend} close={close:.2f} "
+            f"prHi={prior_high:.2f} prLo={prior_low:.2f} -> {direction or 'None'}")
+        return signal
 
     def open_trade(self, signal):
         """Execute trade with ATR-based stops and broker validation"""
