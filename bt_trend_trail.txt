@@ -88,3 +88,60 @@ is REGIME, not edge, and will be stated as such in the verdict.
 ------------------------------------------------------------------------------------------------
 END OF PRE-REGISTRATION. Results are appended below, in a later commit.
 ================================================================================================
+
+================================================================================================
+RESULTS  (appended after the pre-registration above; criteria applied as written)
+================================================================================================
+
+------------------------------------------------------------------------------------------------
+STAGE 1 -- IN-SAMPLE 2021-01-01..2023-12-31, slippage 1.5x, full live gates
+------------------------------------------------------------------------------------------------
+                         trades   win%      net     PF     exp    maxDD   boot p
+a) ALWAYS                  1492   30.4     -193  0.996   -0.13    -3115   0.5281
+b) FIRST_OF_SESSION         773   29.4    -3329  0.868   -4.31    -5380   0.9226
+c) LONG_ONLY                875   30.3    -1391  0.950   -1.59    -3459   0.6987
+
+  a) ALWAYS
+      BUY     803 trades  net GBP      -134  win  30.6%
+      SELL    689 trades  net GBP       -59  win  30.2%
+      per-year net: 2021: -494 (504)  2022: +1147 (492)  2023: -847 (496)
+      bootstrap 95% CI on net: [GBP -6963, GBP 6940]
+  b) FIRST_OF_SESSION
+      BUY     416 trades  net GBP     -1541  win  30.3%
+      SELL    357 trades  net GBP     -1787  win  28.3%
+      per-year net: 2021: -3485 (258)  2022: -292 (258)  2023: +449 (257)
+      bootstrap 95% CI on net: [GBP -7727, GBP 1358]
+  c) LONG_ONLY
+      BUY     875 trades  net GBP     -1391  win  30.3%
+      SELL      0 trades  net GBP         0  win   0.0%
+      per-year net: 2021: -1724 (302)  2022: -919 (273)  2023: +1253 (300)
+      bootstrap 95% CI on net: [GBP -6591, GBP 4015]
+
+------------------------------------------------------------------------------------------------
+ELIGIBILITY GATE (pre-registered): expectancy > 0 AND bootstrap P(net<=0) < 0.05
+------------------------------------------------------------------------------------------------
+  a) ALWAYS                expectancy   -0.13 [FAIL]   boot p 0.5281 [FAIL]   -> NOT ELIGIBLE
+  b) FIRST_OF_SESSION      expectancy   -4.31 [FAIL]   boot p 0.9226 [FAIL]   -> NOT ELIGIBLE
+  c) LONG_ONLY             expectancy   -1.59 [FAIL]   boot p 0.6987 [FAIL]   -> NOT ELIGIBLE
+
+================================================================================================
+OUTCOME: NO VARIANT PASSED THE IN-SAMPLE ELIGIBILITY GATE.
+================================================================================================
+
+Per the pre-registered REJECTION BRANCH: H1 is REJECTED at the in-sample stage.
+The out-of-sample window 2024-2026 is NOT touched and remains unspent.
+No variant is promoted. No parameter is tuned. The experiment ends here.
+
+The H4-trend + ATR-trailing-exit wrapper does not show positive expectancy on
+2021-2023 under realistic conditions. Combined with Step 1 (the breakout entry
+adds nothing over random entries), there is no evidence of an edge anywhere in
+this strategy -- neither in the signal nor in the wrapper.
+
+------------------------------------------------------------------------------------------------
+SLIPPAGE SENSITIVITY (IN-SAMPLE) -- reported only; MUST NOT influence selection
+------------------------------------------------------------------------------------------------
+                                0.0x        1.0x        1.5x        2.0x
+a) ALWAYS                       2059         869        -193        -795
+b) FIRST_OF_SESSION             -561       -2128       -3329       -4533
+c) LONG_ONLY                    -598        -884       -1391       -1846
+
