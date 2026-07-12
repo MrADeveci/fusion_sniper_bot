@@ -13,9 +13,13 @@ Validated method (lab, walk-forward 2021-2023 in-sample / 2024-2026 out-of-sampl
     (default 20) M15 bars; short on a break below the prior-N low; only in the H4-trend
     direction.
   - Exit (validated "Variant 2"): SL = sl_atr_mult x ATR(M15) (default 1.5), NO fixed take
-    profit, ratcheting ATR trailing stop = trail_atr_mult x ATR (default 3.5, mid-shelf for
-    robustness margin), activating once price is trail_activation_atr x ATR in profit.
-    No scalp quick-profit, no breakeven.
+    profit, ratcheting ATR trailing stop = trail_atr_mult x ATR, activating once price is
+    trail_activation_atr x ATR in profit. No scalp quick-profit, no breakeven.
+    TRAIL: the default here is 3.0 to MATCH config.json STRATEGY.momentum.trail_atr_mult,
+    which is what the live bot actually builds the strategy from. This default previously
+    said 3.5 and called itself "the live default", but it never applied live (config always
+    overrides it) -- it only leaked into the backtester, so the lab was validating a
+    parameterisation the bot does not run. Change config.json, not this line.
   - Risk-based sizing: lots derived from the stop distance so each trade risks a set amount
     (flat amount for backtest parity, percent-of-equity for live).
   - Session: enter only between session_start_uk and session_end_uk UK local time. One
@@ -35,7 +39,7 @@ DEFAULTS = dict(
     breakout_lookback=20,
     atr_period=14,
     sl_atr_mult=1.5,
-    trail_atr_mult=3.5,
+    trail_atr_mult=3.0,             # matches config.json (what the live bot runs)
     trail_activation_atr=1.0,
     session_start_uk=7,
     session_end_uk=18,

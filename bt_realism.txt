@@ -1,0 +1,109 @@
+================================================================================================
+MOMENTUM BREAKOUT -- REALISM REBUILD
+================================================================================================
+generated              : 2026-07-12 21:25 UTC
+parameterisation       : FROZEN at live config.json STRATEGY.momentum, NOT re-tuned
+  trail_atr_mult       : 3.0  <- the live bot builds the strategy from
+                          config.json, so 3.0 is what actually runs. The module
+                          default was 3.5 and never applied live; corrected to 3.0.
+  sl_atr_mult          : 1.5
+  h4_ema / lookback    : 50 / 20
+  session (UK)         : 07:00-18:00
+  sizing               : flat, risk GBP 50.0/trade
+
+broker facts (mt5.symbol_info XAUUSD, ICMarketsSC-MT5-4, read 2026-06-05):
+  swap_mode            : 1 (POINTS)
+  swap_long            : -54.015 pts = -54.015 USD/lot/night
+  swap_short           : 46.175 pts = +46.175 USD/lot/night
+  swap_rollover3days   : 3 (WEDNESDAY) -> 3x on the Tue->Wed rollover
+  commission           : GBP 5.52/lot round turn
+
+news blackouts:
+  source: ACTUAL published release dates (federalreserve.gov FOMC calendar; BLS release
+          archives enumerated via the Wayback CDX index, cross-checked against the
+          BLS schedule + 2025 lapse-revised-release-dates pages)
+  events: NFP 65, CPI 65, FOMC 44
+  window: -30min / +30min around each release (config NEWS_FILTER buffers)
+  times : NFP/CPI 08:30 US-Eastern, FOMC 14:00 US-Eastern, converted per-date via
+          zoneinfo (so the UK clock time of each blackout is right in both DST regimes)
+  note  : reflects the 2025 shutdown (Oct NFP + Oct CPI were CANCELLED and are
+          correctly absent) and the 2026 lapse (Jan-26 jobs report -> Wed 11 Feb).
+
+================================================================================================
+1. WHAT THE OLD BENCHMARK CLAIMED  (fixed UTC+2, no swap, no slippage, no gates)
+================================================================================================
+                           trades   win%       net      PF     exp     maxDD
+IN-SAMPLE  2021-01-01..2023-12-31    956   29.2      1355   1.044    1.42     -2213
+OUT-SAMPLE 2024-01-01..2026-06-05    779   29.9      2548   1.104    3.27     -1850
+
+================================================================================================
+2. THE SAME STRATEGY UNDER REALISTIC CONDITIONS
+================================================================================================
+   slippage = 1.5x spread on every entry and every stop-out fill
+
+                           trades   win%       net      PF     exp     maxDD
+  DST clock + swap + slip     926   28.8        15   1.000    0.02     -2293   IS
+  DST clock + swap + slip     771   28.3      -272   0.989   -0.35     -1880   OOS
+  + FULL LIVE GATES           824   28.3      -773   0.971   -0.94     -3085   IS
+  + FULL LIVE GATES           636   28.9       802   1.039    1.26     -1600   OOS
+
+   attribution (net GBP):
+   window     old claim     realism      +gates       delta
+   IS              1355          15        -773       -2128
+   OOS             2548        -272         802       -1746
+
+   OOS overnight / swap detail (realism costs, gates off):
+     trades held overnight : 119 of 771 (15.4%)
+     total swap charged    : GBP -315.34
+       longs  : GBP -477.64 over 95 nights (cost)
+       shorts : GBP 162.30 over 36 nights (credit)
+     triple-swap nights    : 30
+     total commission      : GBP 499.51
+
+================================================================================================
+3. GATE ABLATION (OOS, realism costs, one gate at a time)
+================================================================================================
+                           trades   win%       net      PF     exp     maxDD
+  no gates                    771   28.3      -272   0.989   -0.35     -1880
+  daily loss only (60)        730   28.6       175   1.007    0.24     -1881
+                             blocked: daily_loss=91
+  daily profit only (20)      691   28.5       180   1.008    0.26     -1639
+                             blocked: daily_profit=169
+  extreme ATR only (>20)      760   28.3      -292   0.988   -0.38     -1865
+                             blocked: atr=20
+  cooldown only (60s)         771   28.3      -272   0.989   -0.35     -1880
+  news only                   756   28.3      -420   0.983   -0.56     -1887
+                             blocked: news=28
+  ALL LIVE GATES              636   28.9       802   1.039    1.26     -1600
+                             blocked: daily_loss=93, daily_profit=151, atr=18, news=23
+
+================================================================================================
+4. SLIPPAGE SENSITIVITY (OOS, full live gates)
+================================================================================================
+                           trades   win%       net      PF     exp     maxDD
+  slippage 0.0x spread        635   29.8      1945   1.097    3.06     -1455
+  slippage 1.0x spread        634   29.2      1245   1.061    1.96     -1553
+  slippage 1.5x spread        636   28.9       802   1.039    1.26     -1600   <- default
+  slippage 2.0x spread        636   28.9       546   1.026    0.86     -1655
+
+================================================================================================
+5. SIGNIFICANCE (full live gates, slippage 1.5x)
+================================================================================================
+  IS: 824 trades | net GBP -773 | PF 0.971 | expectancy GBP -0.94 | maxDD GBP -3085
+      bootstrap (10,000 resamples): P(net <= 0) = 0.6128
+      95% CI on net: [GBP -6280, GBP 5039]
+  OOS: 636 trades | net GBP 802 | PF 1.039 | expectancy GBP 1.26 | maxDD GBP -1600
+      bootstrap (10,000 resamples): P(net <= 0) = 0.3723
+      95% CI on net: [GBP -3722, GBP 5534]
+
+  permutation baseline (OOS): 200 runs. Entry TIMING randomised within the
+  session; same H4-trend direction filter, same exits, same gates, same costs.
+  Asks: does the BREAKOUT trigger beat entering at a random in-session time in
+  the trend direction?
+      eligible in-session bars : 27,587
+      random-entry net GBP     : mean 378, sd 1755, median 330
+      random-entry trades/run  : mean 443
+      random-entry range       : [-4247, 6041]
+      ACTUAL strategy net      : 802 GBP
+      P(random >= actual)      : 0.4200
+
