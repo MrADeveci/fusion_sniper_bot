@@ -235,6 +235,20 @@ class TelegramCommandHandler:
             self.logger.error(f"Failed to get updates: {e}")
             return None
     
+    def _paper_flag(self):
+        """SAFETY: mirror SYSTEM.paper_mode into the relaunch command.
+
+        Re-read from disk so /start reflects the config the bot is about to load, not
+        the copy cached when this handler started. Without this, a restart would drop a
+        --paper that was only ever passed on the command line and go LIVE.
+        """
+        try:
+            paper = bool(self.load_config().get('SYSTEM', {}).get('paper_mode', False))
+        except Exception as e:
+            self.logger.error(f"Could not re-read paper_mode ({e}); launching without --paper")
+            return ''
+        return ' --paper' if paper else ''
+
     def handle_start(self):
         """Handle /start command - Launch bot in new Windows Terminal tab"""
         try:
@@ -248,15 +262,19 @@ class TelegramCommandHandler:
                 self.manual_stop_flag.unlink()
                 self.logger.info("Removed manual stop flag")
             
-            self.logger.info("Launching bot in new Windows Terminal tab...")
-            
+            paper_flag = self._paper_flag()
+            self.logger.info(
+                f"Launching bot in new Windows Terminal tab "
+                f"({'PAPER (--paper)' if paper_flag else 'LIVE (no --paper)'})..."
+            )
+
             wt_command = [
                 'wt', '-w', '0', 'nt',
                 '--title', f'Fusion Sniper Bot - {self.symbol}',
                 '--tabColor', '#00FF00',
                 '-d', self.bot_dir,
                 'cmd', '/c',
-                f'color 0A && python main_bot.py {os.path.basename(self.config_file)}'
+                f'color 0A && python main_bot.py {os.path.basename(self.config_file)}{paper_flag}'
             ]
             
             process = subprocess.Popen(

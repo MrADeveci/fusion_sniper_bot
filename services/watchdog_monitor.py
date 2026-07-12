@@ -139,22 +139,40 @@ class WatchdogMonitor:
         manual_stop_flag = Path(paths.get('manual_stop_flag', 'logs/manual_stop.flag'))
         return manual_stop_flag.exists()
     
+    def _paper_flag(self):
+        """SAFETY: mirror SYSTEM.paper_mode into the relaunch command.
+
+        Re-read from disk so a restart reflects the config the bot is about to load,
+        not the copy cached when this watchdog started. Without this, a restart would
+        drop a --paper that was only ever passed on the command line and go LIVE.
+        """
+        try:
+            paper = bool(self.load_config().get('SYSTEM', {}).get('paper_mode', False))
+        except SystemExit:
+            raise
+        except Exception as e:
+            print(f"Could not re-read paper_mode ({e}); launching without --paper")
+            return ''
+        return ' --paper' if paper else ''
+
     def start_bot(self):
         """Start the bot"""
         try:
             print(f"Starting bot with config: {self.config_file}")
-            
+
             # Launch in new Windows Terminal tab
             bot_dir = os.path.dirname(os.path.abspath(self.config_file))
             symbol = self.config['BROKER']['symbol']
-            
+            paper_flag = self._paper_flag()
+            print(f"Launch mode: {'PAPER (--paper)' if paper_flag else 'LIVE (no --paper)'}")
+
             wt_command = [
                 'wt', '-w', '0', 'nt',
                 '--title', f'Fusion Sniper Bot - {symbol}',
                 '--tabColor', '#00FF00',
                 '-d', bot_dir,
                 'cmd', '/c',
-                f'color 0A && python main_bot.py {os.path.basename(self.config_file)}'
+                f'color 0A && python main_bot.py {os.path.basename(self.config_file)}{paper_flag}'
             ]
             
             subprocess.Popen(

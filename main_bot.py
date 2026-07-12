@@ -39,7 +39,7 @@ class FusionSniperBot:
         self.validate_config()
 
         # v5.0.0: PAPER (dry-run) mode. On when SYSTEM.paper_mode is true OR --paper given.
-        self.paper_mode = bool(paper_mode or self.config.get('SYSTEM', {}).get('paper_mode', False))
+        self._resolve_paper_mode(paper_mode)
         self._paper_ticket_seq = 90000000  # simulated ticket counter
         
         # Setup logging first
@@ -282,11 +282,7 @@ class FusionSniperBot:
         self.logger.info("Fusion Sniper Bot v5.0.0")
         self.logger.info(f"Symbol: {self.symbol}")
         self.logger.info("="*60)
-        if self.paper_mode:
-            self.logger.warning("#" * 60)
-            self.logger.warning("### PAPER MODE ACTIVE - NO REAL ORDERS WILL BE SENT ###")
-            self.logger.warning("### order_send / modify_position are SIMULATED        ###")
-            self.logger.warning("#" * 60)
+        self._log_mode_banner()
         self.logger.info(f"Magic number: {self.magic_number}")
 
         if self.engine == 'momentum':
@@ -349,6 +345,58 @@ class FusionSniperBot:
         # Write status file for remote control
         self.write_status_file()
     
+    def _resolve_paper_mode(self, cli_paper):
+        """Decide PAPER vs LIVE and record which source asked for it.
+
+        PAPER wins if EITHER the config or the CLI asks for it, so a relaunch that
+        drops --paper (watchdog restart, /start) cannot silently go live while the
+        config still says paper_mode=true. An absent SYSTEM.paper_mode key means
+        LIVE -- it is reported rather than quietly assumed safe.
+        """
+        self.paper_cfg_raw = self.config.get('SYSTEM', {}).get('paper_mode', None)
+        cfg_on = bool(self.paper_cfg_raw)          # any truthy value => PAPER
+        self.paper_cli = bool(cli_paper)
+        self.paper_mode = cfg_on or self.paper_cli
+
+        cfg_desc = "ABSENT" if self.paper_cfg_raw is None else repr(self.paper_cfg_raw)
+        if cfg_on and self.paper_cli:
+            self.mode_source = f"config SYSTEM.paper_mode={cfg_desc} AND --paper flag"
+        elif cfg_on:
+            self.mode_source = f"config SYSTEM.paper_mode={cfg_desc}"
+        elif self.paper_cli:
+            self.mode_source = f"--paper flag ONLY (config SYSTEM.paper_mode={cfg_desc})"
+        else:
+            self.mode_source = f"config SYSTEM.paper_mode={cfg_desc}, no --paper flag"
+
+    def _log_mode_banner(self):
+        """State the effective mode and its origin, loudly and unambiguously."""
+        bar = "#" * 64
+        self.logger.warning(bar)
+        if self.paper_mode:
+            self.logger.warning("###  EFFECTIVE MODE: PAPER - NO REAL ORDERS WILL BE SENT")
+            self.logger.warning("###  order_send / modify_position are SIMULATED")
+        else:
+            self.logger.warning("###  EFFECTIVE MODE: LIVE - REAL ORDERS WILL BE SENT")
+        self.logger.warning(f"###  mode source: {self.mode_source}")
+        self.logger.warning(bar)
+
+        if self.paper_cfg_raw is None:
+            self.logger.warning(
+                f"SYSTEM.paper_mode is ABSENT from {self.config_file} - a missing key counts as "
+                "LIVE. Set it explicitly to true or false to remove the ambiguity."
+            )
+        elif not isinstance(self.paper_cfg_raw, bool):
+            self.logger.warning(
+                f"SYSTEM.paper_mode is {self.paper_cfg_raw!r}, not a JSON boolean - it was read as "
+                f"{'PAPER' if bool(self.paper_cfg_raw) else 'LIVE'}. Use true/false."
+            )
+        if self.paper_cli and not bool(self.paper_cfg_raw):
+            self.logger.warning(
+                "PAPER is active via the CLI flag ONLY. A restart that omits --paper (watchdog "
+                "restart, Telegram /start) would run LIVE. Set SYSTEM.paper_mode=true in the "
+                "config to make paper mode survive a restart."
+            )
+
     def load_config(self, config_file):
         """Load configuration from JSON file"""
         try:
