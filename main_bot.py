@@ -348,25 +348,44 @@ class FusionSniperBot:
     def _resolve_paper_mode(self, cli_paper):
         """Decide PAPER vs LIVE and record which source asked for it.
 
-        PAPER wins if EITHER the config or the CLI asks for it, so a relaunch that
-        drops --paper (watchdog restart, /start) cannot silently go live while the
-        config still says paper_mode=true. An absent SYSTEM.paper_mode key means
-        LIVE -- it is reported rather than quietly assumed safe.
-        """
-        self.paper_cfg_raw = self.config.get('SYSTEM', {}).get('paper_mode', None)
-        cfg_on = bool(self.paper_cfg_raw)          # any truthy value => PAPER
-        self.paper_cli = bool(cli_paper)
-        self.paper_mode = cfg_on or self.paper_cli
+        LIVE is only ever reachable through an explicit SYSTEM.paper_mode: false. An
+        absent key, or one that is not a JSON boolean, is a hard startup error -- the
+        bot refuses to run rather than infer a trading mode from an ambiguous config.
 
-        cfg_desc = "ABSENT" if self.paper_cfg_raw is None else repr(self.paper_cfg_raw)
-        if cfg_on and self.paper_cli:
-            self.mode_source = f"config SYSTEM.paper_mode={cfg_desc} AND --paper flag"
-        elif cfg_on:
-            self.mode_source = f"config SYSTEM.paper_mode={cfg_desc}"
+        PAPER then wins if EITHER source asks for it, so a relaunch that drops --paper
+        (watchdog restart, /start) cannot silently go live while the config says true.
+
+        Runs before setup_logging(), so refusal is reported on stderr, not the logger.
+        """
+        sysd = self.config.get('SYSTEM', {})
+        if 'paper_mode' not in sysd or not isinstance(sysd['paper_mode'], bool):
+            found = ("the SYSTEM.paper_mode key is missing" if 'paper_mode' not in sysd
+                     else f"SYSTEM.paper_mode is {sysd['paper_mode']!r}, not a JSON boolean")
+            sys.stderr.write(
+                "\n" + "!" * 72 + "\n"
+                "REFUSING TO START: trading mode is ambiguous.\n\n"
+                f"  config: {self.config_file}\n"
+                f"  problem: {found}\n\n"
+                "The bot will not guess whether to trade for real. Set the mode explicitly:\n\n"
+                '  "SYSTEM": { "paper_mode": true }    <- simulated orders (safe)\n'
+                '  "SYSTEM": { "paper_mode": false }   <- LIVE, real orders will be sent\n\n'
+                "LIVE requires an explicit false. Nothing was traded.\n"
+                + "!" * 72 + "\n"
+            )
+            sys.exit(2)
+
+        self.paper_cfg = sysd['paper_mode']        # guaranteed a real bool from here on
+        self.paper_cli = bool(cli_paper)
+        self.paper_mode = self.paper_cfg or self.paper_cli
+
+        if self.paper_cfg and self.paper_cli:
+            self.mode_source = "config SYSTEM.paper_mode=true AND --paper flag"
+        elif self.paper_cfg:
+            self.mode_source = "config SYSTEM.paper_mode=true"
         elif self.paper_cli:
-            self.mode_source = f"--paper flag ONLY (config SYSTEM.paper_mode={cfg_desc})"
+            self.mode_source = "--paper flag ONLY (config SYSTEM.paper_mode=false)"
         else:
-            self.mode_source = f"config SYSTEM.paper_mode={cfg_desc}, no --paper flag"
+            self.mode_source = "config SYSTEM.paper_mode=false (explicit), no --paper flag"
 
     def _log_mode_banner(self):
         """State the effective mode and its origin, loudly and unambiguously."""
@@ -380,17 +399,7 @@ class FusionSniperBot:
         self.logger.warning(f"###  mode source: {self.mode_source}")
         self.logger.warning(bar)
 
-        if self.paper_cfg_raw is None:
-            self.logger.warning(
-                f"SYSTEM.paper_mode is ABSENT from {self.config_file} - a missing key counts as "
-                "LIVE. Set it explicitly to true or false to remove the ambiguity."
-            )
-        elif not isinstance(self.paper_cfg_raw, bool):
-            self.logger.warning(
-                f"SYSTEM.paper_mode is {self.paper_cfg_raw!r}, not a JSON boolean - it was read as "
-                f"{'PAPER' if bool(self.paper_cfg_raw) else 'LIVE'}. Use true/false."
-            )
-        if self.paper_cli and not bool(self.paper_cfg_raw):
+        if self.paper_cli and not self.paper_cfg:
             self.logger.warning(
                 "PAPER is active via the CLI flag ONLY. A restart that omits --paper (watchdog "
                 "restart, Telegram /start) would run LIVE. Set SYSTEM.paper_mode=true in the "

@@ -243,7 +243,7 @@ class TelegramCommandHandler:
         --paper that was only ever passed on the command line and go LIVE.
         """
         try:
-            paper = bool(self.load_config().get('SYSTEM', {}).get('paper_mode', False))
+            paper = self.load_config().get('SYSTEM', {}).get('paper_mode') is True
         except Exception as e:
             self.logger.error(f"Could not re-read paper_mode ({e}); launching without --paper")
             return ''

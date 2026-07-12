@@ -147,7 +147,7 @@ class WatchdogMonitor:
         drop a --paper that was only ever passed on the command line and go LIVE.
         """
         try:
-            paper = bool(self.load_config().get('SYSTEM', {}).get('paper_mode', False))
+            paper = self.load_config().get('SYSTEM', {}).get('paper_mode') is True
         except SystemExit:
             raise
         except Exception as e:
