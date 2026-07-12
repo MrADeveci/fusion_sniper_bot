@@ -40,9 +40,6 @@
     "trailing_stop_atr_multiple": 2.0,
     "min_profit_for_trail_activation": 1.8,
 
-    "_comment_cooldown": "Trade Cooldown Settings",
-    "trade_cooldown_seconds": 60,
-
     "_comment_profit": "Daily Profit Target",
     "daily_profit_target": 20,
 
@@ -52,8 +49,10 @@
       "atr_period": 14,
       "atr_scalp_threshold": 2.0,
       "scalp_profit_target_gbp": 13.87,
-      "scalp_cooldown_seconds": 30,
-      "normal_cooldown_seconds": 60,
+
+      "_comment_cooldown": "Trade cooldown, SECONDS. 0 = OFF. Must be an explicit 0: main_bot reads normal_cooldown_seconds with a code default of 60, so DELETING this key silently re-enables a 60s cooldown instead of removing it. Disabled because the momentum engine decides on M15 closes, so a 60s cooldown is shorter than one bar and can never bind (proved in bt_realism.txt: the cooldown-only ablation is identical to no gates at all). It was false comfort, not risk control.",
+      "scalp_cooldown_seconds": 0,
+      "normal_cooldown_seconds": 0,
 
       "_comment_limits": "ATR based risk limits",
       "skip_trading_when_atr_extreme": true,
