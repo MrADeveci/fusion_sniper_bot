@@ -52,6 +52,7 @@ from tools.backtest import load_csv, simple_atr_series, M1_CSV          # noqa: 
 from tools.backtest_htf import resample, sanity_check_m15               # noqa: E402
 from tools.btclock import server_clock, uk_day_bounds_to_utc_epoch, utc_epoch_to_dt  # noqa: E402
 from tools.news_calendar import build_blackouts, CALENDAR_NOTE          # noqa: E402
+from modules.broker_costs import swap_cost                              # noqa: E402
 from modules.momentum_strategy import MomentumBreakoutStrategy          # noqa: E402
 
 # ---------------------------------------------------------------------------
@@ -151,24 +152,14 @@ class MomBacktester:
 
     # -- swap ---------------------------------------------------------------
     def _swap_gbp(self, direction, lots, entry_srv_ep, exit_srv_ep):
-        """Charge one rollover per SERVER midnight crossed; triple on the broker's
-        triple-swap day. No rollover is charged on Sat/Sun -- weekend financing is what
-        the triple day exists for."""
+        """Swap via the SHARED model (modules/broker_costs.py) -- the same code the live
+        paper ledger uses, so paper 'net' and backtest 'net' mean the same thing."""
         if not self.costs.swap:
             return 0.0, 0, 0
-        d0, d1 = entry_srv_ep // 86400, exit_srv_ep // 86400
-        n1 = n3 = 0
-        for d in range(int(d0) + 1, int(d1) + 1):
-            wd = datetime.utcfromtimestamp(d * 86400).weekday()   # server-date weekday
-            if wd >= 5:                                           # Sat/Sun: no rollover
-                continue
-            if wd == _PY_WED:
-                n3 += 1
-            else:
-                n1 += 1
-        per_lot = SWAP_LONG_USD if direction == "BUY" else SWAP_SHORT_USD
-        usd = per_lot * lots * (n1 + 3 * n3)
-        return usd / GBPUSD, n1, n3
+        return swap_cost(direction, lots, entry_srv_ep, exit_srv_ep,
+                         swap_long_pts=SWAP_LONG_PTS, swap_short_pts=SWAP_SHORT_PTS,
+                         point=POINT, contract_size=CONTRACT, fx_rate=GBPUSD,
+                         swap_rollover3days=SWAP_3DAY_DOW)
 
     # -- entry gates --------------------------------------------------------
     def _gate_blocked(self, ep_utc, atr_val):

@@ -25,6 +25,10 @@ from modules.risk_manager import RiskManager
 from modules.news_filter import EconomicNewsFilter
 from modules.telegram_notifier import TelegramNotifier
 from modules.trade_statistics import TradeStatistics
+from modules.atomic_json import write_json_atomic, read_json_quarantine
+from modules.broker_costs import swap_cost, commission_cost
+
+PAPER_TICKET_BASE = 90000000     # simulated tickets start above any real broker ticket
 
 
 class FusionSniperBot:
@@ -40,7 +44,7 @@ class FusionSniperBot:
 
         # v5.0.0: PAPER (dry-run) mode. On when SYSTEM.paper_mode is true OR --paper given.
         self._resolve_paper_mode(paper_mode)
-        self._paper_ticket_seq = 90000000  # simulated ticket counter
+        self._paper_ticket_seq = PAPER_TICKET_BASE   # re-seeded from state in _restore_paper_state
         
         # Setup logging first
         self.setup_logging()
@@ -56,7 +60,8 @@ class FusionSniperBot:
         self.strategy = FusionStrategy(self.config)
         self.risk_manager = RiskManager(self.config)
         self.news_filter = EconomicNewsFilter(self.config)
-        self.stats_tracker = TradeStatistics(self.config)
+        # Simulated trades go to trade_statistics_{symbol}_paper.json, never the live file.
+        self.stats_tracker = TradeStatistics(self.config, paper=self.paper_mode)
         
         # Initialize Telegram
         telegram_config = self.config.get('TELEGRAM', {})
@@ -273,10 +278,16 @@ class FusionSniperBot:
             except Exception:
                 pass
 
-        # v5.0.0: simulated positions + realised-P&L ledger for paper mode
-        self.paper_positions = {}
-        self.paper_closed_trades = []   # [{'time': datetime, 'net': float}] feeds daily/weekly caps
-        
+        # v5.0.0: simulated positions + realised-P&L ledger for paper mode.
+        # Restored from bot_state.json so a restart does not lose the paper book or
+        # recycle ticket numbers. [{'time': datetime, 'net': float, 'ticket': int}]
+        self._restore_paper_state()
+
+        # Paper cost model: the SAME swap/commission arithmetic as the backtester, so a
+        # paper "net" is comparable with a backtest "net" rather than a gross price move.
+        self.commission_per_lot = float(order_exec.get('commission_per_lot_gbp', 5.52))
+        self._paper_swap_warned = False
+
         # Logging
         self.logger.info("="*60)
         self.logger.info("Fusion Sniper Bot v5.0.0")
@@ -690,37 +701,89 @@ class FusionSniperBot:
             return False
 
     def _load_state(self):
-        """H3: load persisted {last_trade_time, last_trade_type, positions{ticket:...}}."""
-        try:
-            if self.state_file.exists():
-                with open(self.state_file, 'r') as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    return data
-        except Exception as e:
+        """Load persisted state. A corrupt file is moved aside, never silently discarded."""
+        logger = getattr(self, "logger", None)
+        data, quarantined = read_json_quarantine(self.state_file, logger)
+        if quarantined and logger:
+            logger.error("Bot state was CORRUPT and has been quarantined. Restored nothing: "
+                         "open positions will be re-adopted from the broker, but paper "
+                         "positions and the paper ledger for this run are LOST.")
+        return data or {}
+
+    def _restore_paper_state(self):
+        """Restore the paper book: simulated positions, the realised ledger, and the ticket
+        sequence. Without this, a restart resurrected an empty book while bot_state.json
+        still referenced the old tickets, and the sequence restarted at 90000000 -- so
+        fresh trades RECYCLED ticket numbers already used by closed ones."""
+        st = self._restored_state
+
+        self.paper_positions = {}
+        for tkt, p in (st.get('paper_positions') or {}).items():
             try:
-                self.logger.error(f"Error loading state file: {e}")
+                self.paper_positions[int(tkt)] = dict(p)
+            except (TypeError, ValueError):
+                continue
+
+        self.paper_closed_trades = []
+        for t in (st.get('paper_closed_trades') or []):
+            try:
+                self.paper_closed_trades.append({
+                    'time': datetime.fromisoformat(t['time']),
+                    'net': float(t['net']),
+                    'ticket': t.get('ticket'),
+                })
             except Exception:
-                pass
-        return {}
+                continue
+
+        # Seed the sequence ABOVE every ticket we have ever issued -- the saved counter,
+        # any still-open paper position, any closed one in the ledger, and any ticket left
+        # in the tracked-positions block of a stale state file.
+        seen = [int(st.get('paper_ticket_seq') or 0), PAPER_TICKET_BASE]
+        seen += [int(t) for t in self.paper_positions]
+        seen += [int(t['ticket']) for t in self.paper_closed_trades
+                 if isinstance(t.get('ticket'), int)]
+        for tkt in (st.get('positions') or {}):
+            try:
+                if int(tkt) >= PAPER_TICKET_BASE:
+                    seen.append(int(tkt))
+            except (TypeError, ValueError):
+                continue
+        self._paper_ticket_seq = max(seen)
+
+        if self.paper_mode and (self.paper_positions or self.paper_closed_trades):
+            self.logger.warning(
+                f"[PAPER] restored {len(self.paper_positions)} open simulated position(s), "
+                f"{len(self.paper_closed_trades)} closed trade(s); next ticket "
+                f"{self._paper_ticket_seq + 1}")
 
     def _save_state(self):
-        """H3: persist cooldown clock and per-position entry_atr/breakeven_applied."""
+        """Persist the cooldown clock, per-position data, and the FULL paper book.
+
+        Written atomically (temp file + os.replace): a crash mid-write can no longer leave
+        a truncated bot_state.json that the loader would silently treat as 'no state'.
+        """
         try:
             positions = {}
-            for ticket, pd in getattr(self, "tracked_positions", {}).items():
+            for ticket, pdata in getattr(self, "tracked_positions", {}).items():
                 positions[str(ticket)] = {
-                    'entry_atr': pd.get('entry_atr', 0),
-                    'breakeven_applied': bool(pd.get('breakeven_applied', False)),
+                    'entry_atr': pdata.get('entry_atr', 0),
+                    'breakeven_applied': bool(pdata.get('breakeven_applied', False)),
                 }
             data = {
                 'last_trade_time': self.last_trade_time.isoformat() if self.last_trade_time else None,
                 'last_trade_type': self.last_trade_type,
                 'positions': positions,
+                # --- paper book (meaningless in live mode, but harmless and cheap) ---
+                'paper_ticket_seq': int(getattr(self, '_paper_ticket_seq', PAPER_TICKET_BASE)),
+                'paper_positions': {str(k): v for k, v in
+                                    getattr(self, 'paper_positions', {}).items()},
+                'paper_closed_trades': [
+                    {'time': t['time'].isoformat() if hasattr(t['time'], 'isoformat') else str(t['time']),
+                     'net': float(t['net']), 'ticket': t.get('ticket')}
+                    for t in getattr(self, 'paper_closed_trades', [])
+                ],
             }
-            self.state_file.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.state_file, 'w') as f:
-                json.dump(data, f, indent=2)
+            write_json_atomic(self.state_file, data)
         except Exception as e:
             self.logger.error(f"Error saving state file: {e}")
 
@@ -831,25 +894,109 @@ class FusionSniperBot:
         return "Stop Loss hit"
 
     def _paper_check_sl_tp(self, position):
-        """PAPER: simulate the broker closing a position on SL/TP touch."""
+        """PAPER: simulate the broker closing a position on an SL/TP touch.
+
+        Checking only the CURRENT tick was dishonest: the loop runs every few seconds, so
+        any stop breached BETWEEN two checks was missed entirely, and the position carried
+        on as if the stop had never been hit. That flatters results -- it silently deletes
+        exactly the losers a real stop would have taken.
+
+        We now replay the M1 bars that closed since this position was last checked and
+        detect the breach against the bar EXTREMES. On a breach we fill at the WORSE of
+        (the stop, the breaching bar's open if it gapped straight through, the current
+        price) -- which is how a stop behaves through a gap: it becomes a market order at
+        whatever is available, not a guarantee of the stop price.
+
+        TP fills are NOT improved on a gap (filled at the TP), so the simulation cannot
+        flatter itself in either direction.
+        """
         tick = mt5.symbol_info_tick(self.symbol)
         if tick is None:
             return False
-        if position.type == 0:  # BUY -> exits on bid
-            if position.sl > 0 and tick.bid <= position.sl:
-                self._close_paper_position(position.ticket, position.sl, self._sl_exit_reason(position))
+        pos = self.paper_positions.get(position.ticket)
+        if pos is None:
+            return False
+
+        is_buy = position.type == 0
+        cur = tick.bid if is_buy else tick.ask          # the side this position exits on
+        sl, tp = position.sl, position.tp
+
+        # M1 bars that closed since the last check (bar times are SERVER epochs, like ticks)
+        last_seen = int(pos.get('last_check_srv') or pos.get('time_server') or 0)
+        highs_lows = []
+        try:
+            bars = mt5.copy_rates_from_pos(self.symbol, mt5.TIMEFRAME_M1, 0, 60)
+            if bars is not None:
+                for b in bars:
+                    if int(b['time']) > last_seen:
+                        highs_lows.append((float(b['open']), float(b['high']), float(b['low'])))
+        except Exception as e:
+            self.logger.error(f"[PAPER] could not fetch M1 bars for fill simulation: {e}")
+        pos['last_check_srv'] = int(getattr(tick, 'time', 0) or 0)
+
+        # ---- stop loss -----------------------------------------------------
+        if sl > 0:
+            worst = None
+            for o, h, l in highs_lows:
+                if (is_buy and l <= sl) or ((not is_buy) and h >= sl):
+                    # gapped straight through the stop? then the open is the realistic fill
+                    gap = o if ((is_buy and o <= sl) or ((not is_buy) and o >= sl)) else None
+                    cands = [sl] + ([gap] if gap is not None else [])
+                    w = min(cands) if is_buy else max(cands)
+                    worst = w if worst is None else (min(worst, w) if is_buy else max(worst, w))
+            touched_now = (is_buy and cur <= sl) or ((not is_buy) and cur >= sl)
+            if worst is not None or touched_now:
+                cands = [sl, cur] + ([worst] if worst is not None else [])
+                fill = min(cands) if is_buy else max(cands)
+                if worst is not None and not touched_now:
+                    self.logger.warning(
+                        f"[PAPER] stop for #{position.ticket} was breached BETWEEN checks "
+                        f"(bar extreme), filling at {fill:.2f} not the current {cur:.2f}")
+                self._close_paper_position(position.ticket, fill, self._sl_exit_reason(position))
                 return True
-            if position.tp > 0 and tick.bid >= position.tp:
-                self._close_paper_position(position.ticket, position.tp, "Take Profit hit")
-                return True
-        else:  # SELL -> exits on ask
-            if position.sl > 0 and tick.ask >= position.sl:
-                self._close_paper_position(position.ticket, position.sl, self._sl_exit_reason(position))
-                return True
-            if position.tp > 0 and tick.ask <= position.tp:
-                self._close_paper_position(position.ticket, position.tp, "Take Profit hit")
+
+        # ---- take profit (no gap improvement: filled AT the TP) -------------
+        if tp > 0:
+            hit = (is_buy and cur >= tp) or ((not is_buy) and cur <= tp)
+            if not hit:
+                for o, h, l in highs_lows:
+                    if (is_buy and h >= tp) or ((not is_buy) and l <= tp):
+                        hit = True
+                        break
+            if hit:
+                self._close_paper_position(position.ticket, tp, "Take Profit hit")
                 return True
         return False
+
+    def _paper_trade_costs(self, pos, exit_srv_epoch):
+        """Commission + swap for a simulated trade, using the SAME model as the backtest
+        (modules/broker_costs.py). Without these, paper 'net' was a gross price move and
+        systematically overstated the result."""
+        direction = "BUY" if pos['type'] == 0 else "SELL"
+        lots = float(pos['volume'])
+        commission = commission_cost(lots, self.commission_per_lot)
+        swap = 0.0
+        nights = (0, 0)
+        try:
+            si = mt5.symbol_info(self.symbol)
+            if si is not None and getattr(si, 'swap_mode', 0) == 1:   # POINTS
+                swap, n1, n3 = swap_cost(
+                    direction, lots,
+                    entry_epoch_srv=int(pos.get('time_server') or 0),
+                    exit_epoch_srv=int(exit_srv_epoch or 0),
+                    swap_long_pts=float(si.swap_long), swap_short_pts=float(si.swap_short),
+                    point=float(si.point), contract_size=float(si.trade_contract_size),
+                    fx_rate=float(self.momentum.gbpusd) if self.momentum else 1.0,
+                    swap_rollover3days=getattr(si, 'swap_rollover3days', 3))
+                nights = (n1, n3)
+            elif si is not None and not self._paper_swap_warned:
+                self._paper_swap_warned = True
+                self.logger.warning(
+                    f"[PAPER] swap_mode={si.swap_mode} is not POINTS; swap is NOT modelled "
+                    "for this symbol, so paper net EXCLUDES financing.")
+        except Exception as e:
+            self.logger.error(f"[PAPER] swap calculation failed ({e}); swap treated as 0")
+        return commission, swap, nights
 
     def _close_paper_position(self, ticket, exit_price, reason, scalp=False):
         """PAPER: simulate a close -> log, record stats, notify, drop the sim position."""
@@ -857,19 +1004,28 @@ class FusionSniperBot:
         if pos is None:
             return
         direction = "BUY" if pos['type'] == 0 else "SELL"
-        profit = 0.0
+        gross = 0.0
         try:
             action = mt5.ORDER_TYPE_BUY if pos['type'] == 0 else mt5.ORDER_TYPE_SELL
             calc = mt5.order_calc_profit(action, self.symbol, pos['volume'], pos['price_open'], exit_price)
-            profit = float(calc) if calc is not None else 0.0
+            gross = float(calc) if calc is not None else 0.0
         except Exception:
-            profit = 0.0
+            gross = 0.0
+
+        # Paper NET = gross price move - commission + swap, via the same model the lab uses.
+        tick = mt5.symbol_info_tick(self.symbol)
+        exit_srv = int(getattr(tick, 'time', 0) or 0) if tick else 0
+        commission, swap, (n1, n3) = self._paper_trade_costs(pos, exit_srv)
+        profit = gross - commission + swap
+
+        nights = n1 + n3
         self.logger.warning(
-            f"[PAPER] Would CLOSE #{ticket} {direction} @ {exit_price} ({reason}) P&L {profit:.2f}"
+            f"[PAPER] Would CLOSE #{ticket} {direction} @ {exit_price} ({reason}) "
+            f"NET {profit:.2f} = gross {gross:.2f} - comm {commission:.2f} + swap {swap:.2f}"
+            + (f" ({nights} night(s), {n3} triple)" if nights else "")
         )
-        # v5.0.0: record realised paper P&L so it feeds the daily/weekly caps.
-        # (order_calc_profit is price-based; paper does not model commission/swap.)
-        self.paper_closed_trades.append({'time': datetime.now(), 'net': float(profit)})
+        self.paper_closed_trades.append(
+            {'time': datetime.now(), 'net': float(profit), 'ticket': int(ticket)})
         profit_pips = abs(exit_price - pos['price_open']) / self.pip_size
         if profit < 0:
             profit_pips = -profit_pips
@@ -877,7 +1033,10 @@ class FusionSniperBot:
             self.stats_tracker.end_trade({
                 'exit_price': exit_price,
                 'exit_reason': reason,
-                'profit': profit,
+                'profit': profit,            # NET, so the stats file is not flattered either
+                'gross_profit': gross,
+                'commission': commission,
+                'swap': swap,
                 'profit_pips': profit_pips,
                 'expected_exit': pos['tp'] if profit > 0 else pos['sl'],
             })
@@ -1908,11 +2067,17 @@ class FusionSniperBot:
                     f"[PAPER] Would OPEN {order_type} {volume} {self.symbol} @ {price} "
                     f"SL {sl} TP {tp} (ticket {ticket})"
                 )
+                # time_server: the BROKER's clock (tick.time), not the VPS clock. Swap
+                # counts SERVER midnights, and the server is not UTC (and its offset moves
+                # with US DST), so a local timestamp would mis-count financing.
+                _tk = mt5.symbol_info_tick(self.symbol)
+                _srv = int(getattr(_tk, 'time', 0) or 0) if _tk else 0
                 self.paper_positions[ticket] = {
                     'ticket': ticket, 'type': 0 if order_type == 'BUY' else 1,
                     'price_open': price, 'sl': sl, 'orig_sl': sl, 'tp': tp, 'volume': volume,
                     'magic': self.magic_number, 'symbol': self.symbol,
                     'time': int(datetime.now().timestamp()), 'profit': 0.0,
+                    'time_server': _srv, 'last_check_srv': _srv,
                 }
             else:
                 request = {
@@ -2222,6 +2387,20 @@ class FusionSniperBot:
                             status_message_counter += 1
                             if status_message_counter % 5 == 0:
                                 self.logger.info(f"[HEARTBEAT] Bot alive | {status_msg}")
+
+                        # The trading-hours gate blocks NEW ENTRIES ONLY. An open position
+                        # must still be tracked, trailed and stopped out while the gate is
+                        # shut -- previously this branch 'continue'd straight past
+                        # management, so a position held into a closed window ran with its
+                        # trailing stop frozen and (in paper) its SL/TP never simulated.
+                        # This is a LIVE bug too, not just a paper one.
+                        self.update_tracked_positions()
+                        held = self._get_open_positions()
+                        if held:
+                            self.logger.info(
+                                f"[CLOSED] Managing {len(held)} open position(s) "
+                                "(entries blocked, management continues)")
+                            self.manage_positions()
 
                         time.sleep(60)
                         consecutive_errors = 0

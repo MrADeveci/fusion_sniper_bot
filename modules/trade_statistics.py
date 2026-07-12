@@ -10,27 +10,40 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict
 
+from modules.atomic_json import write_json_atomic, read_json_quarantine
+
+
 class TradeStatistics:
     """Track and analyze trade performance"""
     
-    def __init__(self, config: dict):
-        """Initialize statistics tracker"""
+    def __init__(self, config: dict, paper: bool = False):
+        """Initialize statistics tracker.
+
+        paper=True writes to trade_statistics_{symbol}_paper.json. Simulated trades must
+        NEVER be mixed into the live statistics file: once they are, the live win rate,
+        profit factor and history are permanently polluted by trades that never existed,
+        and there is no reliable way to separate them afterwards.
+        """
         self.config = config
         self.logger = logging.getLogger(__name__)
-        
+        self.paper = bool(paper)
+
         # Get symbol for file naming
         self.symbol = config['BROKER']['symbol']
-        
+
         # Load statistics config
         stats_config = config.get('STATISTICS', {})
         self.enabled = stats_config.get('enabled', True)
-        
+
         # Get stats file path from config (with symbol replacement).
         # v5.0.0 (M6): config key is 'stats_file_path' (accept legacy 'log_file' too).
         stats_file_pattern = stats_config.get('stats_file_path',
                                               stats_config.get('log_file',
                                                                'logs/trade_statistics_{symbol}.json'))
         self.stats_file = stats_file_pattern.replace('{symbol}', self.symbol)
+        if self.paper:
+            p = Path(self.stats_file)
+            self.stats_file = str(p.with_name(f"{p.stem}_paper{p.suffix}"))
 
         # v5.0.0 (M6): config key is 'max_history' (accept legacy 'max_trades_history' too).
         self.max_trades_history = stats_config.get('max_history',
@@ -53,17 +66,14 @@ class TradeStatistics:
         self.logger.info(f"Max history: {self.max_trades_history} trades")
     
     def load_stats(self) -> Dict:
-        """Load statistics from file"""
-        try:
-            stats_path = Path(self.stats_file)
-            if stats_path.exists():
-                with open(stats_path, 'r') as f:
-                    return json.load(f)
-            else:
-                return self.create_new_stats()
-        except Exception as e:
-            self.logger.error(f"Error loading stats: {e}")
-            return self.create_new_stats()
+        """Load statistics. A corrupt file is moved aside with a timestamp, not silently
+        replaced by an empty one -- losing trade history to a bad parse should be loud."""
+        data, quarantined = read_json_quarantine(self.stats_file, self.logger)
+        if quarantined:
+            self.logger.error(
+                f"Statistics file was corrupt and was moved to {quarantined.name}. "
+                "Starting a fresh stats file; the old history is preserved on disk.")
+        return data if data is not None else self.create_new_stats()
     
     def create_new_stats(self) -> Dict:
         """Create new statistics structure"""
@@ -100,14 +110,10 @@ class TradeStatistics:
         }
     
     def save_stats(self):
-        """Save statistics to file"""
+        """Save statistics ATOMICALLY (temp file + os.replace), so a crash mid-write
+        cannot truncate the history file."""
         try:
-            stats_path = Path(self.stats_file)
-            stats_path.parent.mkdir(parents=True, exist_ok=True)
-            
-            with open(stats_path, 'w') as f:
-                json.dump(self.stats, f, indent=2)
-            
+            write_json_atomic(self.stats_file, self.stats)
             self.logger.debug(f"Statistics saved to {self.stats_file}")
         except Exception as e:
             self.logger.error(f"Error saving stats: {e}")

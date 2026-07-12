@@ -235,6 +235,50 @@ class TelegramCommandHandler:
             self.logger.error(f"Failed to get updates: {e}")
             return None
     
+    # ------------------------------------------------------------------
+    # PAPER MODE awareness. In paper mode the broker knows nothing about the bot's
+    # positions or P&L -- they live in the bot's own state file. Querying MT5 for them
+    # (as these commands used to) reports the account's REAL state, which in paper mode is
+    # an empty, unchanging account. That reads as "the bot is doing nothing" when it is
+    # actually trading a full simulated book.
+    # ------------------------------------------------------------------
+    def _is_paper(self):
+        try:
+            return self.load_config().get('SYSTEM', {}).get('paper_mode') is True
+        except Exception:
+            return False
+
+    def _paper_state(self):
+        """The bot's persisted paper book: (positions{ticket:...}, closed_trades[])."""
+        try:
+            state_file = Path(self.bot_dir) / 'logs' / 'bot_state.json'
+            if not state_file.exists():
+                return {}, []
+            with open(state_file, 'r') as f:
+                st = json.load(f)
+            return (st.get('paper_positions') or {}), (st.get('paper_closed_trades') or [])
+        except Exception as e:
+            self.logger.error(f"Could not read paper state: {e}")
+            return {}, []
+
+    def _paper_daily_net(self):
+        """Realised paper P&L for today, from the paper ledger."""
+        _, closed = self._paper_state()
+        today = datetime.now().date()
+        total, n = 0.0, 0
+        for t in closed:
+            try:
+                if datetime.fromisoformat(t['time']).date() == today:
+                    total += float(t['net'])
+                    n += 1
+            except Exception:
+                continue
+        return total, n
+
+    def _paper_stats_file(self):
+        p = Path(self.trade_statistics_file)
+        return str(p.with_name(f"{p.stem}_paper{p.suffix}"))
+
     def _paper_flag(self):
         """SAFETY: mirror SYSTEM.paper_mode into the relaunch command.
 
@@ -705,30 +749,43 @@ class TelegramCommandHandler:
             profit = equity - balance
             profit_pct = (profit / balance * 100) if balance > 0 else 0
             
-            daily_profit = self.get_daily_profit()
-            
-            positions = mt5.positions_get(symbol=self.symbol)
-            if positions:
-                pos_count = len([p for p in positions if p.magic == self.magic_number])
+            paper = self._is_paper()
+
+            if paper:
+                # Positions and P&L come from the bot's simulated book, NOT the broker.
+                paper_pos, _ = self._paper_state()
+                pos_count = len(paper_pos)
+                daily_profit, n_today = self._paper_daily_net()
             else:
-                pos_count = 0
-            
+                daily_profit = self.get_daily_profit()
+                positions = mt5.positions_get(symbol=self.symbol)
+                pos_count = len([p for p in positions
+                                 if p.magic == self.magic_number]) if positions else 0
+
             # Get detailed bot status state
             status_emoji, status_text = self._get_bot_status_state()
             bot_status = f"{status_emoji} {status_text}"
-            
+
+            header = ("📝 <b>PAPER MODE — SIMULATED, NO REAL ORDERS</b>\n"
+                      "<i>positions and P/L below are simulated; the account figures are real</i>\n\n"
+                      if paper else "")
+            acct_label = "Account (untouched in paper)" if paper else "Account"
+            pl_label = "Paper Daily P/L (net)" if paper else "Daily P/L"
+            pos_label = "Simulated Positions" if paper else "Active Positions"
+
             message = f"""🤖 <b>Status</b>
 
-{bot_status}
+{header}{bot_status}
 
+<b>{acct_label}</b>
 💰 Balance: £{balance:.2f}
 📊 Equity: £{equity:.2f}
 📈 Open P/L: £{profit:.2f} ({profit_pct:+.2f}%)
 
-📍 Daily P/L: £{daily_profit:.2f}
+📍 {pl_label}: £{daily_profit:.2f}
 🎯 Daily Target: £{self.config['TRADING']['daily_profit_target']:.2f}
 
-🎯 Active Positions: {pos_count}/{self.config['RISK']['max_positions_per_bot']}
+🎯 {pos_label}: {pos_count}/{self.config['RISK']['max_positions_per_bot']}
 
 ⏰ {datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}"""
 
@@ -742,8 +799,11 @@ class TelegramCommandHandler:
     def handle_positions(self):
         """Handle /positions command"""
         try:
+            if self._is_paper():
+                return self._handle_positions_paper()
+
             positions = mt5.positions_get(symbol=self.symbol)
-            
+
             if not positions:
                 return self.send_message("📊 No open positions")
             
@@ -775,12 +835,62 @@ class TelegramCommandHandler:
             self.logger.error(f"Error in handle_positions: {e}")
             return self.send_message(f"❌ Error: {str(e)}")
     
+    def _handle_positions_paper(self):
+        """PAPER: list the SIMULATED positions from the bot's state file. The broker has no
+        record of these -- querying MT5 would report an empty account and look like the bot
+        was idle."""
+        paper_pos, _ = self._paper_state()
+        if not paper_pos:
+            return self.send_message("📝 <b>PAPER MODE</b>\n\n📊 No open simulated positions")
+
+        tick = mt5.symbol_info_tick(self.symbol)
+        message = (f"📝 <b>PAPER MODE — SIMULATED POSITIONS ({len(paper_pos)})</b>\n"
+                   f"<i>not real; the broker holds nothing</i>\n\n")
+
+        for tkt, p in sorted(paper_pos.items()):
+            try:
+                is_buy = int(p.get('type', 0)) == 0
+                pos_type = "BUY" if is_buy else "SELL"
+                entry = float(p.get('price_open', 0))
+                vol = float(p.get('volume', 0))
+                cur = 0.0
+                if tick:
+                    cur = tick.bid if is_buy else tick.ask
+                # floating P&L is a GROSS price move (commission/swap land at close)
+                floating = 0.0
+                if cur:
+                    calc = mt5.order_calc_profit(
+                        mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL,
+                        self.symbol, vol, entry, cur)
+                    floating = float(calc) if calc is not None else 0.0
+                opened = datetime.fromtimestamp(int(p.get('time', 0)))
+                dur = datetime.now() - opened
+                hours = int(dur.total_seconds() / 3600)
+                minutes = int((dur.total_seconds() % 3600) / 60)
+
+                message += f"""<b>{self.symbol}</b> - {pos_type} (sim #{tkt})
+💹 Entry: {entry:.2f}
+📍 Current: {cur:.2f}
+💰 Floating P/L: £{floating:.2f} <i>(gross)</i>
+🎯 SL: {float(p.get('sl') or 0):.2f} | TP: {float(p.get('tp') or 0):.2f}
+📦 Volume: {vol}
+⏰ Duration: {hours}h {minutes}m
+
+"""
+            except Exception as e:
+                self.logger.error(f"Error rendering paper position {tkt}: {e}")
+
+        return self.send_message(message)
+
     def handle_daily(self):
         """Handle /daily command - Shows NET profit with swap - TIMEZONE AWARE"""
         try:
+            if self._is_paper():
+                return self._handle_daily_paper()
+
             if not mt5.initialize():
                 return self.send_message("❌ MT5 connection failed")
-            
+
             # Get timezone offset from config
             broker_timezone_offset = self.config.get('BROKER', {}).get('broker_timezone_offset', 0)
             
@@ -886,6 +996,49 @@ Loss Total: £{losing_profit:.2f}
             self.logger.error(f"Error in handle_daily: {e}")
             return self.send_message(f"❌ Error getting daily stats: {str(e)}")
     
+    def _handle_daily_paper(self):
+        """PAPER: report the simulated ledger. The broker's deal history is empty in paper
+        mode, so the live query would always report a flat, profitless day."""
+        paper_pos, closed = self._paper_state()
+        today = datetime.now().date()
+        todays = []
+        for t in closed:
+            try:
+                if datetime.fromisoformat(t['time']).date() == today:
+                    todays.append(t)
+            except Exception:
+                continue
+
+        net = sum(float(t['net']) for t in todays)
+        wins = [t for t in todays if float(t['net']) > 0]
+        losses = [t for t in todays if float(t['net']) < 0]
+        target = self.config['TRADING'].get('daily_profit_target', 0)
+        max_loss = self.config.get('RISK', {}).get('max_daily_loss', 0)
+
+        lines = [
+            "📝 <b>PAPER MODE — SIMULATED LEDGER</b>",
+            "<i>net = gross - commission + swap, same cost model as the backtest</i>",
+            "",
+            f"📅 <b>Today ({today.strftime('%d/%m/%Y')})</b>",
+            f"💰 Net P/L: £{net:.2f}",
+            f"📈 Closed: {len(todays)}  (W {len(wins)} / L {len(losses)})",
+            f"🎯 Target: £{float(target):.2f}"
+            + ("  ✅ REACHED — new entries paused" if target and net >= float(target) else ""),
+            f"🛑 Loss limit: £{float(max_loss):.2f}"
+            + ("  ⛔ BREACHED — day is dead" if max_loss and net <= -abs(float(max_loss)) else ""),
+            f"📊 Open simulated positions: {len(paper_pos)}",
+        ]
+        if todays:
+            lines += ["", "<b>Closed today:</b>"]
+            for t in todays[-10:]:
+                ts = datetime.fromisoformat(t['time']).strftime('%H:%M')
+                tk = t.get('ticket', '?')
+                lines.append(f"  {ts}  #{tk}  £{float(t['net']):+.2f}")
+        lines += ["", f"📈 Lifetime simulated trades: {len(closed)}",
+                  f"💵 Lifetime net: £{sum(float(t['net']) for t in closed):.2f}",
+                  "", f"⏰ {datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}"]
+        return self.send_message("\n".join(lines))
+
     def handle_health(self):
         """Handle /health command with intelligent bot state detection - UPDATED"""
         try:
@@ -951,16 +1104,23 @@ Daily Target: £{self.config['TRADING']['daily_profit_target']:.2f}
     def handle_stats(self):
         """Handle /stats command using config file path"""
         try:
-            # Using config path
-            if not os.path.exists(self.trade_statistics_file):
-                return self.send_message("📊 No statistics data available yet")
-            
-            with open(self.trade_statistics_file, 'r') as f:
+            # PAPER: read the SEPARATE paper stats file. Simulated trades are never mixed
+            # into the live statistics, so reading the live file here would report nothing.
+            paper = self._is_paper()
+            stats_path = self._paper_stats_file() if paper else self.trade_statistics_file
+            banner = ("📝 <b>PAPER MODE — SIMULATED STATISTICS</b>\n"
+                      "<i>from the paper stats file; live stats are kept separate</i>\n\n"
+                      if paper else "")
+
+            if not os.path.exists(stats_path):
+                return self.send_message(f"{banner}📊 No statistics data available yet")
+
+            with open(stats_path, 'r') as f:
                 stats = json.load(f)
-            
+
             total_trades = stats.get('total_trades', 0)
             if total_trades == 0:
-                return self.send_message("📊 No trades recorded yet")
+                return self.send_message(f"{banner}📊 No trades recorded yet")
             
             win_rate = stats.get('win_rate', 0)
             avg_profit = stats.get('average_profit', 0)
@@ -972,7 +1132,7 @@ Daily Target: £{self.config['TRADING']['daily_profit_target']:.2f}
             sessions = stats.get('trades_by_session', {})
             exit_reasons = stats.get('exit_reasons', {})
             
-            message = f"""📊 <b>{self.symbol} Trading Statistics</b>
+            message = f"""{banner}📊 <b>{self.symbol} Trading Statistics</b>
 
 📈 Total Trades: {total_trades}
 🎯 Win Rate: {win_rate:.1f}%

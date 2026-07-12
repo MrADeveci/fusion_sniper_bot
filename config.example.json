@@ -68,7 +68,10 @@
       "tolerance_pips": 2,
       "market_data_bars": 500,
       "order_send_retries": 2,
-      "min_stop_distance_usd": 0.50
+      "min_stop_distance_usd": 0.50,
+
+      "_comment_commission": "Round-turn commission per lot, ACCOUNT currency. Used by the paper ledger so paper net = gross - commission + swap, matching the backtest cost model.",
+      "commission_per_lot_gbp": 5.52
     },
 
     "_comment_hours": "Trading Hours - UK time (Monday 01:00 - Friday 23:00, Sunday CLOSED)",
