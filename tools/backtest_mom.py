@@ -35,10 +35,40 @@ CONTRACT = 100.0
 POINT = 0.01
 
 
+def _day_key(epoch):   # broker wall-clock date (offset already embedded in epoch)
+    return datetime.utcfromtimestamp(epoch).strftime("%Y-%m-%d")
+
+
+def _week_key(epoch):  # ISO year-week, Monday start (matches week_start_day=monday)
+    iso = datetime.utcfromtimestamp(epoch).isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}"
+
+
 class MomBacktester:
-    def __init__(self, strat: MomentumBreakoutStrategy):
+    def __init__(self, strat: MomentumBreakoutStrategy,
+                 daily_profit_cap=None, weekly_profit_cap=None):
         self.strat = strat
         self.trades = []
+        # Optional realised-NET PROFIT caps. None => OFF, which makes the entry gate a
+        # no-op so the validated (caps-off) behaviour is reproduced byte-for-byte. No
+        # daily-loss limit is modelled here, matching the validated engine.
+        self.daily_profit_cap = daily_profit_cap
+        self.weekly_profit_cap = weekly_profit_cap
+        self._daily_real = {}
+        self._weekly_real = {}
+        self.skipped = 0
+
+    def _entry_capped(self, entry_epoch):
+        """True if a profit cap is active for this day/week (pauses NEW entries only)."""
+        if self.daily_profit_cap is None and self.weekly_profit_cap is None:
+            return False
+        if (self.daily_profit_cap is not None
+                and self._daily_real.get(_day_key(entry_epoch), 0.0) >= self.daily_profit_cap):
+            return True
+        if (self.weekly_profit_cap is not None
+                and self._weekly_real.get(_week_key(entry_epoch), 0.0) >= self.weekly_profit_cap):
+            return True
+        return False
 
     def run(self, win, prior_high, prior_low, h4_ce, h4_trend, h4_min, start_epoch, end_epoch):
         s = self.strat
@@ -98,6 +128,9 @@ class MomBacktester:
                 direction = s.decide_entry(int(h4_trend[hi]), float(c[j]), float(ph), float(pl))
                 if direction is None:
                     continue
+                if self._entry_capped(int(ep[j + 1])):     # profit-cap gate (no-op when caps off)
+                    self.skipped += 1
+                    continue
                 lots = s.lots_for_risk(RISK_FLAT_GBP, a, contract_size=CONTRACT)
                 pending = {"dir": direction, "atr": a, "lots": lots,
                            "session": _session(uk[j + 1])}
@@ -121,6 +154,9 @@ class MomBacktester:
             "gross_pnl": round(gross, 2), "costs": round(costs, 2),
             "net_pnl": round(gross - costs, 2), "session": pos["session"],
         })
+        net = self.trades[-1]["net_pnl"]
+        self._daily_real[_day_key(exit_epoch)] = self._daily_real.get(_day_key(exit_epoch), 0.0) + net
+        self._weekly_real[_week_key(exit_epoch)] = self._weekly_real.get(_week_key(exit_epoch), 0.0) + net
 
 
 def _session(ukhour):
@@ -155,9 +191,37 @@ def summarize(trades, label):
     return out
 
 
+# 4 PROFIT-CAP structures (loss controls identical = none, matching validated engine)
+CAP_CONFIGS = [
+    ("A both (D20+W65)", 20.0, 65.0),
+    ("B daily only (D20)", 20.0, None),
+    ("C weekly only (W65)", None, 65.0),
+    ("D none [=validated]", None, None),
+]
+
+
+def cfg_metrics(trades):
+    df = pd.DataFrame(trades)
+    pnl = df["net_pnl"]
+    wins = pnl[pnl > 0]; losses = pnl[pnl < 0]
+    gl = -losses.sum()
+    pf = (wins.sum() / gl) if gl > 0 else float("inf")
+    eq = pnl.cumsum()
+    dd = float((eq - eq.cummax()).min())
+    df = df.assign(month=pd.to_datetime(df["exit_time"]).dt.to_period("M").astype(str))
+    by_m = df.groupby("month")["net_pnl"].sum()
+    return dict(trades=len(df), win=100.0 * len(wins) / len(df), net=float(pnl.sum()),
+                pf=pf, exp=float(pnl.mean()), dd=dd,
+                pm=int((by_m > 0).sum()), lm=int((by_m <= 0).sum()),
+                worst=(by_m.idxmin(), float(by_m.min())), best=(by_m.idxmax(), float(by_m.max())),
+                nmo=len(by_m))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--trail", type=float, default=3.5, help="trailing stop xATR (default 3.5 live)")
+    ap.add_argument("--caps-compare", action="store_true",
+                    help="run the 4 profit-cap structures (A/B/C/D) through this same engine")
     args = ap.parse_args()
 
     params = dict(h4_ema=50, breakout_lookback=20, atr_period=14, sl_atr_mult=1.5,
@@ -184,8 +248,12 @@ def main():
     h4_trend = np.where(h4_close > h4_ema, 1, np.where(h4_close < h4_ema, -1, 0))
     h4_ce = h4["epoch"].to_numpy() + 4 * 3600
 
-    for label, s, e, tag in [("IN-SAMPLE 2021-01-01..2023-12-31", "2021-01-01", "2023-12-31", "IS"),
-                             ("OUT-OF-SAMPLE 2024-01-01..2026-06-05", "2024-01-01", "2026-06-05", "OOS")]:
+    WINDOWS = [("IN-SAMPLE 2021-01-01..2023-12-31", "2021-01-01", "2023-12-31", "IS"),
+               ("OUT-OF-SAMPLE 2024-01-01..2026-06-05", "2024-01-01", "2026-06-05", "OOS")]
+
+    # prepare each window's arrays once (shared across all cap configs)
+    prepared = []
+    for label, s, e, tag in WINDOWS:
         start_epoch = int(datetime.fromisoformat(s).timestamp()) + OFFSET_H * 3600
         end_epoch = int((datetime.fromisoformat(e) + timedelta(days=1)).timestamp()) + OFFSET_H * 3600
         buf = start_epoch - 45 * 86400
@@ -196,13 +264,53 @@ def main():
                    atr=simple_atr_series(w, 14), uk=w["ukhour"].to_numpy())
         ph = w["high"].rolling(strat.lookback).max().shift(1).to_numpy(float)
         pl = w["low"].rolling(strat.lookback).min().shift(1).to_numpy(float)
-        print(f"\nRunning {label} | M15={len(w)}", flush=True)
-        bt = MomBacktester(strat)
-        bt.run(win, ph, pl, h4_ce, h4_trend, strat.h4_ema, start_epoch, end_epoch)
-        outdir = f"results_MOM_v2_{tag}"
-        os.makedirs(os.path.join(ROOT, outdir), exist_ok=True)
-        pd.DataFrame(bt.trades).to_csv(os.path.join(ROOT, outdir, "trades.csv"), index=False)
-        summarize(bt.trades, f"Variant 2 (module, trail {strat.trail_mult}) | {label}")
+        prepared.append((label, tag, win, ph, pl, start_epoch, end_epoch))
+
+    if not args.caps_compare:
+        # DEFAULT validated path — caps OFF, identical to the recorded benchmark
+        for label, tag, win, ph, pl, start_epoch, end_epoch in prepared:
+            print(f"\nRunning {label} | M15={len(win['o'])}", flush=True)
+            bt = MomBacktester(strat)
+            bt.run(win, ph, pl, h4_ce, h4_trend, strat.h4_ema, start_epoch, end_epoch)
+            outdir = f"results_MOM_v2_{tag}"
+            os.makedirs(os.path.join(ROOT, outdir), exist_ok=True)
+            pd.DataFrame(bt.trades).to_csv(os.path.join(ROOT, outdir, "trades.csv"), index=False)
+            summarize(bt.trades, f"Variant 2 (module, trail {strat.trail_mult}) | {label}")
+        return
+
+    # CAPS-COMPARE path — 4 structures through the SAME engine
+    res = {}
+    for label, tag, win, ph, pl, start_epoch, end_epoch in prepared:
+        for clabel, dcap, wcap in CAP_CONFIGS:
+            bt = MomBacktester(strat, daily_profit_cap=dcap, weekly_profit_cap=wcap)
+            bt.run(win, ph, pl, h4_ce, h4_trend, strat.h4_ema, start_epoch, end_epoch)
+            res[(tag, clabel)] = (cfg_metrics(bt.trades), bt.skipped)
+
+    hdr = (f"{'config':<22}{'trades':>7}{'win%':>6}{'net':>9}{'PF':>7}{'exp':>7}"
+           f"{'maxDD':>9}{'+mo/-mo':>9}{'skip':>6}")
+    for label, tag, *_ in prepared:
+        print(f"\n================ {label} (trail {strat.trail_mult}) ================")
+        print(hdr)
+        for clabel, _, _ in CAP_CONFIGS:
+            m, sk = res[(tag, clabel)]
+            print(f"{clabel:<22}{m['trades']:>7}{m['win']:>6.1f}{m['net']:>9.0f}{m['pf']:>7.3f}"
+                  f"{m['exp']:>7.2f}{m['dd']:>9.0f}{str(m['pm'])+'/'+str(m['lm']):>9}{sk:>6}")
+        print("  worst / best month:")
+        for clabel, _, _ in CAP_CONFIGS:
+            m, _ = res[(tag, clabel)]
+            print(f"    {clabel:<22} worst {m['worst'][0]} {m['worst'][1]:>8.0f}   "
+                  f"best {m['best'][0]} {m['best'][1]:>8.0f}   ({m['nmo']} mo)")
+
+    # correctness gate: D (none) must reproduce the validated Variant 2
+    print("\n================ GATE: config D (none) vs validated Variant 2 ================")
+    GATE = {"IS": (956, 1355.46), "OOS": (779, 2548.45)}   # from logs/parity_mom.txt (trail 3.0)
+    for tag in ("IS", "OOS"):
+        m, _ = res[(tag, "D none [=validated]")]
+        gt, gn = GATE[tag]
+        ok = (m["trades"] == gt) and (abs(m["net"] - gn) < 1.0)
+        print(f"  {tag}: D none -> {m['trades']} trades / £{m['net']:.2f}   "
+              f"expected {gt} / £{gn:.2f}   {'PASS' if ok else 'FAIL'}"
+              + ("" if strat.trail_mult == 3.0 else "  (gate defined at trail 3.0)"))
 
 
 if __name__ == "__main__":
