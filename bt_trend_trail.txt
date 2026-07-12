@@ -1,0 +1,90 @@
+================================================================================================
+PRE-REGISTRATION -- H4 TREND FILTER + ATR TRAILING EXIT, AS A HYPOTHESIS IN ITS OWN RIGHT
+================================================================================================
+Written and committed BEFORE any variant was run. Git history is the timestamp: this block
+is committed in "lab: pre-register trend+trail hypothesis" and the results are appended in a
+LATER commit. Nothing below was chosen after seeing a number.
+
+------------------------------------------------------------------------------------------------
+BACKGROUND
+------------------------------------------------------------------------------------------------
+Step 1 (bt_realism.txt) showed the M15 breakout entry adds nothing over random in-session
+entries in the trend direction (permutation P(random >= actual) = 0.42). Whatever positive
+expectancy existed therefore lived in the WRAPPER -- the H4 EMA50 trend filter and the
+1.5xATR stop / 3.0xATR ratchet trailing exit -- not in the signal.
+
+HYPOTHESIS (H1): the wrapper alone has positive expectancy. Entries are deliberately dumb;
+that is the point. If the wrapper is the edge, dumb entries in the trend direction with the
+trailing exit should make money.
+
+NULL (H0): the wrapper has no edge. Any positive result is regime (the 2024-26 gold bull),
+selection, or noise.
+
+------------------------------------------------------------------------------------------------
+VARIANTS (exactly three; NO variant may be added later)
+------------------------------------------------------------------------------------------------
+(a) ALWAYS     : at each in-session M15 close, if flat: H4 close > EMA50 -> long; < EMA50 ->
+                 short. One position at a time. Exit ONLY via the 1.5xATR initial stop and the
+                 3.0xATR ratchet trail.
+(b) FIRST_OF_SESSION : as (a), but at most ONE entry per session day (first qualifying bar).
+(c) LONG_ONLY  : as (a), longs only. Exists to expose how much of any result is simply the
+                 gold bull rather than the rule.
+
+------------------------------------------------------------------------------------------------
+CONDITIONS (identical for every run; frozen; no sweeps, no tuning)
+------------------------------------------------------------------------------------------------
+Engine    : the Step 1 realism engine (tools/backtest_mom.py).
+            DST-correct server clock; swap (swap_long -54.015 / swap_short +46.175 pts,
+            triple Wednesday); spread in the fill; SHORT stops triggered on the ASK;
+            gap-throughs fill at the bar open beyond the stop.
+Slippage  : 1.5x spread is the PRIMARY condition and the ONLY one selection may use.
+            0x / 1x / 2x are reported as sensitivity and MUST NOT influence selection.
+Gates     : the full live gate set (daily loss 60, daily profit target 20, extreme-ATR skip
+            >20, news blackouts; cooldown is 0 and provably cannot bind).
+Params    : frozen at live config.json STRATEGY.momentum -- h4_ema 50, sl_atr_mult 1.5,
+            trail_atr_mult 3.0, trail_activation 1.0, session 07:00-18:00 UK, flat GBP 50 risk.
+Windows   : IN-SAMPLE 2021-01-01..2023-12-31. OUT-OF-SAMPLE 2024-01-01..2026-06-05.
+
+------------------------------------------------------------------------------------------------
+ACCEPTANCE CRITERIA (binding; decided before any run)
+------------------------------------------------------------------------------------------------
+STAGE 1 -- IN-SAMPLE. All three variants are run on IS 2021-2023 at slippage 1.5x.
+
+  ELIGIBILITY GATE. A variant is eligible for OOS only if BOTH hold in-sample:
+      E1. net expectancy per trade > 0 GBP, AND
+      E2. bootstrap P(net <= 0) < 0.05      (10,000 resamples of the trade P&Ls)
+
+  SELECTION. Among ELIGIBLE variants, select the one with the LOWEST bootstrap P(net <= 0).
+  Tie-break (differences < 0.01): higher net expectancy per trade.
+
+  REJECTION BRANCH -- stated in advance so it cannot be rationalised away later:
+  If NO variant passes the eligibility gate, H1 is REJECTED at the in-sample stage, the
+  out-of-sample window is NOT touched, and that is the end of the experiment. OOS is not
+  spent on a variant that already failed in-sample. A negative finding is a valid finding.
+
+STAGE 2 -- OUT-OF-SAMPLE. The single selected variant gets exactly ONE run on OOS
+2024-2026. The other two never touch OOS. No re-selection after seeing OOS.
+
+  H1 IS SUPPORTED only if ALL THREE hold out-of-sample:
+      O1. net P&L > 0, AND
+      O2. bootstrap P(net <= 0) < 0.05, AND
+      O3. permutation P(shuffled-trend >= actual) < 0.05
+  Failing any one of O1/O2/O3 means H1 is NOT supported. There is no partial credit and no
+  "promising, needs tuning" verdict.
+
+PERMUTATION TEST (Stage 2). Step 1 permuted entry TIMING. Here the claim under test is the
+TREND CONDITION, so the H4 trend flag is what gets permuted: the per-H4-bar trend series is
+SHUFFLED (preserving its +1/-1/0 mix but destroying its relationship to price) and the variant
+is re-run. This asks: does trading in the ACTUAL H4 trend direction beat trading in a random
+direction with the same long/short mix, everything else identical? 200 shuffles.
+
+------------------------------------------------------------------------------------------------
+MANDATORY REPORTING (regardless of outcome)
+------------------------------------------------------------------------------------------------
+For EVERY run: trades, win%, net, PF, expectancy/trade, max drawdown; LONG vs SHORT P&L
+separately; and PER-YEAR net P&L. If a result is carried entirely by 2024-2026 longs, that
+is REGIME, not edge, and will be stated as such in the verdict.
+
+------------------------------------------------------------------------------------------------
+END OF PRE-REGISTRATION. Results are appended below, in a later commit.
+================================================================================================

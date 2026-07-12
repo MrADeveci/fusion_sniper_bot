@@ -195,8 +195,16 @@ class MomBacktester:
 
     # -- main loop ----------------------------------------------------------
     def run(self, win, prior_high, prior_low, h4_ce, h4_trend, h4_min,
-            start_ep, end_ep, random_mask=None):
+            start_ep, end_ep, random_mask=None, entry_mode="breakout"):
+        """entry_mode:
+             breakout         -- the Step 1 strategy: M15 close breaks the prior-N extreme
+             always           -- (a) enter EVERY in-session bar while flat, in the H4 direction
+             first_of_session -- (b) as (a) but at most ONE entry per session day
+             long_only        -- (c) as (a) but longs only
+           The dumb modes exist to test the H4-trend + trailing-exit WRAPPER on its own.
+        """
         s = self.strat
+        entry_days = set()
         o, h, l, c = win["o"], win["h"], win["l"], win["c"]
         ep, ep_srv, sp, atr, uk = win["ep"], win["ep_srv"], win["sp"], win["atr"], win["uk"]
         slipm = self.costs.slip_mult
@@ -275,18 +283,33 @@ class MomBacktester:
                     if not random_mask[j] or trend == 0:
                         continue
                     direction = "BUY" if trend > 0 else "SELL"
-                else:
+                elif entry_mode == "breakout":
                     ph, pl = prior_high[j], prior_low[j]
                     if ph != ph or pl != pl:
                         continue
                     direction = s.decide_entry(trend, float(c[j]), float(ph), float(pl))
                     if direction is None:
                         continue
+                else:
+                    # deliberately dumb entries: direction is the H4 trend, nothing else
+                    if trend == 0:
+                        continue
+                    if entry_mode == "long_only" and trend < 0:
+                        continue
+                    if entry_mode == "first_of_session":
+                        day = datetime.fromtimestamp(
+                            int(ep[j + 1]), tz=timezone.utc).strftime("%Y-%m-%d")
+                        if day in entry_days:
+                            continue
+                    direction = "BUY" if trend > 0 else "SELL"
                 if self._gate_blocked(int(ep[j + 1]), float(a)):
                     continue
                 lots = s.lots_for_risk(self.strat.risk_flat_gbp, a, contract_size=CONTRACT)
                 pending = {"dir": direction, "atr": a, "lots": lots,
                            "session": _session(uk[j + 1])}
+                if entry_mode == "first_of_session":
+                    entry_days.add(datetime.fromtimestamp(
+                        int(ep[j + 1]), tz=timezone.utc).strftime("%Y-%m-%d"))
 
         if pos is not None:
             self._close(pos, float(c[N - 1]), "EOD", int(ep[N - 1]), int(ep_srv[N - 1]))
@@ -425,10 +448,11 @@ def prepare(strat, legacy=False):
     return prepared, h4_ce, h4_trend
 
 
-def run_one(strat, p, h4_ce, h4_trend, costs, gates, legacy=False, random_mask=None):
+def run_one(strat, p, h4_ce, h4_trend, costs, gates, legacy=False, random_mask=None,
+            entry_mode="breakout"):
     bt = MomBacktester(strat, costs, gates, legacy=legacy)
     bt.run(p["win"], p["ph"], p["pl"], h4_ce, h4_trend, strat.h4_ema,
-           p["start"], p["end"], random_mask=random_mask)
+           p["start"], p["end"], random_mask=random_mask, entry_mode=entry_mode)
     return bt
 
 
