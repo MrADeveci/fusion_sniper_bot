@@ -70,3 +70,7 @@ results*/
 
 # Machine-specific launchers (keep local)
 *.bat
+
+# Portable MT5 terminal for this instance (binaries + saved broker credentials).
+# NEVER commit: 400MB+ of binaries, and Config/ holds the terminal.lic and saved logins.
+MT5/

@@ -8,6 +8,7 @@ import subprocess
 import os
 import sys
 import json
+import requests
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -44,6 +45,11 @@ class WatchdogMonitor:
         system_config = self.config.get('SYSTEM', {})
         self.log_dir = Path(system_config.get('log_directory', 'logs'))
         self.bot_status_file = Path(system_config.get('bot_status_file', 'logs/bot_status.json'))
+
+        # Dead-man's switch. SECRET: anyone with this URL can forge liveness, so it lives
+        # only in the gitignored config.json. Absent => feature off.
+        self.deadman_url = system_config.get('deadman_url') or None
+        self.last_deadman_ok = None
         
         # Track last known bot state to prevent duplicate restarts
         self.last_bot_running = False
@@ -113,6 +119,78 @@ class WatchdogMonitor:
         """Backwards-compatible boolean: hung still counts as RUNNING (do not double-start)."""
         state, _ = self.bot_liveness()
         return state != STOPPED
+
+    # ------------------------------------------------------------------
+    # DEAD-MAN'S SWITCH
+    #
+    # Every other alarm in this stack can only fire if something is still alive to fire it.
+    # A dead-man switch inverts that: the watchdog must keep proving it is alive, and
+    # SILENCE is the alarm. It therefore covers the states nothing else does -- machine
+    # powered off, sat at the login screen after a reboot, watchdog killed, watchdog wedged.
+    #
+    # The ping fires at the end of EVERY completed cycle, including out-of-trading-hours and
+    # manual-stop cycles. That is deliberate: those are still cycles the watchdog is
+    # consciously minding. If we only pinged while trading, the switch would fire every
+    # weekend and be trained out of you as noise -- the classic way a dead-man switch dies.
+    #
+    # The URL is a secret (anyone holding it can forge liveness), so it lives in the
+    # gitignored config.json as SYSTEM.deadman_url and is NEVER committed. Absent = off.
+    # ------------------------------------------------------------------
+    def deadman_ping(self):
+        """GET the heartbeat URL. Failures are logged and swallowed -- a monitoring
+        outage must never take down the thing it is monitoring."""
+        if not self.deadman_url:
+            return False
+        try:
+            r = requests.get(self.deadman_url, timeout=5)
+            if r.status_code >= 300:
+                print(f"Dead-man ping returned HTTP {r.status_code}")
+                return False
+            self.last_deadman_ok = datetime.now()
+            return True
+        except Exception as e:
+            print(f"Dead-man ping FAILED (continuing): {e}")
+            return False
+
+    def startup_recovery_alert(self):
+        """Announce that the watchdog has (re)started -- which, unattended, usually means
+        the machine rebooted. Reports what it found so a reboot is never silent."""
+        state, info = self.bot_liveness()
+        label = {ALIVE: "running", HUNG: "running but HUNG", STOPPED: "stopped"}.get(state, "unknown")
+        if state == STOPPED:
+            label = "stopped by flag (will NOT auto-start)" if self.check_manual_stop_flag() \
+                    else "stopped (watchdog will start it)"
+
+        age = info.get('heartbeat_age')
+        if age is None:
+            age_txt = "none found (no prior heartbeat)"
+        else:
+            age_txt = f"{age:.0f}s ago"
+
+        boot = ""
+        try:
+            import ctypes
+            up_s = ctypes.windll.kernel32.GetTickCount64() / 1000.0
+            boot = f"\n🖥 Machine up: {up_s/60:.0f} min (booted {datetime.now() - timedelta(seconds=up_s):%d/%m %H:%M})"
+            if up_s < 600:
+                boot += "\n<b>⚠️ Machine booted recently — this looks like a reboot.</b>"
+        except Exception:
+            pass
+
+        paper = ""
+        try:
+            if self.config.get('SYSTEM', {}).get('paper_mode') is True:
+                paper = "\n📝 Mode: PAPER (simulated)"
+        except Exception:
+            pass
+
+        msg = (f"🔄 <b>Watchdog started</b> — machine may have rebooted\n\n"
+               f"🤖 Bot: <b>{label}</b>\n"
+               f"💓 Last bot heartbeat before now: {age_txt}"
+               f"{paper}{boot}\n\n"
+               f"⏰ {datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}")
+        self.alert(msg)
+        print(f"Recovery alert sent. Bot: {label}, last heartbeat: {age_txt}")
 
     def alert(self, text):
         """Fire a Telegram alert. Never let a notification failure kill the watchdog."""
@@ -237,11 +315,18 @@ class WatchdogMonitor:
         """Main watchdog loop"""
         print("Watchdog Monitor started")
         print(f"Monitoring: {self.config['BROKER']['symbol']}")
+        print(f"Dead-man switch: {'ENABLED' if self.deadman_url else 'disabled (SYSTEM.deadman_url absent)'}")
         print("Press Ctrl+C to stop\n")
-        
+
+        # Announce the (re)start BEFORE the first cycle: if the machine rebooted, this is
+        # the message that tells you it happened.
+        self.startup_recovery_alert()
+        self.deadman_ping()          # resume pings immediately, don't wait a full cycle
+
         # v5.0.0 (C2): the loop body is wrapped so a transient error logs and CONTINUES
         # instead of killing the watchdog. KeyboardInterrupt still exits cleanly.
         while True:
+            cycle_ok = True
             try:
                 # Check if within trading hours
                 if not self.is_within_trading_hours():
@@ -324,8 +409,16 @@ class WatchdogMonitor:
                 break
             except Exception as e:
                 # Log and keep monitoring rather than exiting the watchdog.
+                cycle_ok = False
                 print(f"[{datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')}] Watchdog loop error (continuing): {e}")
                 time.sleep(self.check_interval)
+            finally:
+                # Ping only when the cycle COMPLETED. A cycle that threw is not proof the
+                # watchdog is minding anything, so we stay silent and let the switch fire.
+                # `continue` inside the try still reaches this finally -- which is what makes
+                # the out-of-hours and manual-stop cycles ping too.
+                if cycle_ok:
+                    self.deadman_ping()
 
 def main():
     """Entry point"""

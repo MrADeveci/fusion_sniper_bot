@@ -295,6 +295,9 @@
 
   "SYSTEM": {
     "_comment": "System-wide settings",
+    "_comment_deadman": "Dead-man switch. BetterStack Heartbeat URL, pinged by the WATCHDOG at the end of every completed cycle (expected period 5min, grace 10min). SILENCE is the alarm: pings stop if the machine is off, sat at the login screen, or the watchdog is dead/wedged. SECRET - anyone with this URL can forge liveness. Real URL belongs ONLY in the gitignored config.json. Remove the key to disable.",
+    "deadman_url": "https://uptime.betterstack.com/api/v1/heartbeat/YOUR_HEARTBEAT_TOKEN",
+
     "_comment_paper": "Paper/dry-run mode: simulate orders, never hit the broker. Set false only for live trading.",
     "paper_mode": true,
     "_comment_paths": "File Paths",
