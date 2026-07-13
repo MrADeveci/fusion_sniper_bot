@@ -10,10 +10,16 @@ import time
 import logging
 import requests
 import subprocess
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any
 import MetaTrader5 as mt5
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from modules.atomic_json import write_json_atomic                        # noqa: E402
+from modules.liveness import (check_liveness, lock_path, redact_token,   # noqa: E402
+                              STOPPED, ALIVE, HUNG)
 
 # ============================================================================
 # WINDOWS CONSOLE UTF-8 ENCODING FIX
@@ -82,7 +88,10 @@ class TelegramCommandHandler:
         self.magic_number = self.config['BROKER']['magic_number']
         self.bot_token = self.config['TELEGRAM']['bot_token']
         self.chat_id = self.config['TELEGRAM']['chat_id']
-        self.last_update_id = 0
+        # Persisted, so a restart does not replay every queued command (see _load_offset).
+        # bot_dir is set further down, so resolve it here for the offset path.
+        self.bot_dir = os.path.dirname(os.path.abspath(self.config_file))
+        self.last_update_id = self._load_offset()
         
         # Pre-read nested config objects (v5.0.0 M6: use the keys the config actually has)
         paths_cfg = handler_config.get('paths', {})
@@ -221,6 +230,61 @@ class TelegramCommandHandler:
             self.logger.error(f"Failed to send message: {e}")
             return None
     
+    # ------------------------------------------------------------------
+    # COMMAND REPLAY GUARD
+    #
+    # last_update_id lived only in memory. On restart it reset to 0, so Telegram happily
+    # re-delivered every update still in its 24h queue and the handler EXECUTED THEM ALL
+    # AGAIN -- a /start, a /stop, a /close from yesterday, replayed against a live account
+    # the moment the handler came back up. Two independent guards now:
+    #   1. the offset is PERSISTED, so a restart resumes where it left off; and
+    #   2. any message older than MAX_MESSAGE_AGE is ignored regardless of the offset,
+    #      so even a lost/corrupt offset file cannot resurrect a stale command.
+    # ------------------------------------------------------------------
+    MAX_MESSAGE_AGE_SECONDS = 120
+
+    def _offset_file(self):
+        return Path(self.bot_dir) / 'logs' / 'telegram_offset.json'
+
+    def _load_offset(self):
+        try:
+            p = self._offset_file()
+            if p.exists():
+                with open(p, 'r') as f:
+                    off = int(json.load(f).get('last_update_id', 0))
+                if off > 0:
+                    self.logger.info(f"Resuming Telegram updates from offset {off} "
+                                     "(stale commands will not be replayed)")
+                return max(off, 0)
+        except Exception as e:
+            self.logger.error(f"Could not load Telegram offset ({e}); starting from 0. "
+                              "The age guard still blocks stale commands.")
+        return 0
+
+    def _save_offset(self):
+        try:
+            write_json_atomic(self._offset_file(),
+                              {'last_update_id': int(self.last_update_id),
+                               'saved_at': datetime.now().isoformat()})
+        except Exception as e:
+            self.logger.error(f"Could not persist Telegram offset: {e}")
+
+    def _is_stale(self, message):
+        """True if this message is too old to act on."""
+        ts = message.get('date')
+        if not ts:
+            return False
+        age = time.time() - float(ts)
+        if age > self.MAX_MESSAGE_AGE_SECONDS:
+            text = (message.get('text') or '')[:40]
+            who = (message.get('from') or {}).get('id')
+            self.logger.warning(
+                f"IGNORED stale Telegram command (age {age:.0f}s > "
+                f"{self.MAX_MESSAGE_AGE_SECONDS}s): {text!r} from user {who}. "
+                "Queued while the handler was down; not replaying it.")
+            return True
+        return False
+
     def get_updates(self):
         """Get new updates from Telegram"""
         try:
@@ -230,9 +294,18 @@ class TelegramCommandHandler:
                 'timeout': self.long_poll_timeout
             }
             response = requests.get(url, params=params, timeout=self.long_poll_request_timeout)
-            return response.json()
+            data = response.json()
+            # A non-ok response used to be discarded silently, so an expired token or a
+            # 409 (another getUpdates consumer) looked exactly like "no new messages".
+            if not data.get('ok'):
+                self.logger.error(
+                    f"Telegram getUpdates ok=false: "
+                    f"error_code={data.get('error_code')} "
+                    f"description={data.get('description')!r}")
+            return data
         except Exception as e:
-            self.logger.error(f"Failed to get updates: {e}")
+            # requests puts the full URL -- including the bot token -- in its exception text.
+            self.logger.error(f"Failed to get updates: {redact_token(e, self.bot_token)}")
             return None
     
     # ------------------------------------------------------------------
@@ -498,32 +571,30 @@ class TelegramCommandHandler:
             self.logger.error(f"Error finding parent CMD process: {str(e)}")
             return None
     
-    def _is_bot_running(self) -> bool:
-        """Check if bot is currently running by checking status file"""
-        if not self.status_file.exists():
-            return False
-        
+    def _bot_liveness(self):
+        """(state, info): STOPPED | ALIVE | HUNG, identity-verified + heartbeat."""
         try:
-            status = self._read_status_file()
-            pid = status.get('pid')
-            
-            if not pid:
-                return False
-            
-            check_command = f'tasklist /FI "PID eq {pid}" /NH'
-            result = subprocess.run(
-                check_command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=self.system_command_timeout
-            )
-            
-            return str(pid) in result.stdout
-            
+            return check_liveness(self.config, self.status_file,
+                                  lock_path(self.config, self.bot_dir_logs()))
         except Exception as e:
-            self.logger.error(f"Error checking if bot is running: {str(e)}")
-            return False
+            self.logger.error(f"Error checking bot liveness: {redact_token(e, self.bot_token)}")
+            return STOPPED, {}
+
+    def bot_dir_logs(self):
+        return os.path.join(self.bot_dir, 'logs')
+
+    def _is_bot_running(self) -> bool:
+        """True if a live instance holds the bot's identity.
+
+        A HUNG bot still counts as RUNNING: /start must not launch a second instance
+        alongside a wedged one. The watchdog is what kills and replaces a hang.
+
+        The old check shelled out to tasklist with the PID interpolated into a string and
+        substring-matched the result, so any process that inherited the dead bot's recycled
+        PID reported it as running. Identity (image name) + heartbeat now decide.
+        """
+        state, _ = self._bot_liveness()
+        return state != STOPPED
     
     def _read_status_file(self) -> Dict[str, Any]:
         """Read bot status file"""
@@ -1357,41 +1428,58 @@ Trail: {exit_reasons.get('trailing', 0)} | BE: {exit_reasons.get('breakeven', 0)
             self.send_message(f"❌ Error processing command: {str(e)}")
     
     def run(self):
-        """Main loop - poll for commands"""
-      
+        """Main loop - poll for commands. Returns an exit code (0 = clean)."""
+        rc = 0
         try:
             while True:
                 updates = self.get_updates()
-                
+
                 if updates and updates.get('ok'):
-                    for update in updates.get('result', []):
+                    results = updates.get('result', [])
+                    for update in results:
+                        # Advance the offset for EVERY update, even one we refuse to act on
+                        # -- otherwise a stale command is re-fetched forever.
                         self.last_update_id = update['update_id']
-                        
-                        if 'message' in update:
-                            self.process_command(update['message'])
-                
+
+                        msg = update.get('message')
+                        if msg and not self._is_stale(msg):
+                            self.process_command(msg)
+
+                    if results:
+                        # Persist AFTER the batch: a crash mid-batch replays at most that
+                        # batch, and the age guard still refuses anything genuinely stale.
+                        self._save_offset()
+
                 time.sleep(self.command_poll_interval)
-                
+
         except KeyboardInterrupt:
             print("\nStopping Telegram handler")
             self.logger.info("Telegram handler stopped by user")
         except Exception as e:
-            self.logger.error(f"Fatal error in main loop: {e}")
+            # FATAL: a crashed handler is a bot nobody can stop remotely. It must exit
+            # NON-ZERO so whatever supervises it knows it died rather than finished.
+            self.logger.error(
+                f"Fatal error in main loop: {redact_token(e, self.bot_token)}", exc_info=False)
+            self.logger.error(redact_token(traceback.format_exc(), self.bot_token))
+            rc = 1
         finally:
+            try:
+                self._save_offset()
+            except Exception:
+                pass
             mt5.shutdown()
+        return rc
+
 
 def main():
     """Entry point"""
     try:
         handler = TelegramCommandHandler()
-        handler.run()
+        return handler.run()
     except Exception as e:
-        logging.error(f"Failed to start handler: {e}")
-        import traceback
-        traceback.print_exc()
+        logging.error(f"Failed to start handler: {redact_token(e)}")
+        print(redact_token(traceback.format_exc()))
         return 1
-    
-    return 0
 
 if __name__ == '__main__':
     sys.exit(main())

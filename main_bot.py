@@ -27,6 +27,8 @@ from modules.telegram_notifier import TelegramNotifier
 from modules.trade_statistics import TradeStatistics
 from modules.atomic_json import write_json_atomic, read_json_quarantine
 from modules.broker_costs import swap_cost, commission_cost
+from modules.instance_lock import InstanceLock, AlreadyRunning
+from modules.liveness import lock_path
 
 PAPER_TICKET_BASE = 90000000     # simulated tickets start above any real broker ticket
 
@@ -52,6 +54,25 @@ class FusionSniperBot:
         # Clean old log files (7-day retention)
         self.cleanup_old_logs()
         
+        # SINGLE-INSTANCE LOCK -- before MT5, before any order can possibly be sent.
+        # Two bots on the same symbol+magic would fight over the same position and each
+        # enforce the daily loss limit as if it were the only one trading.
+        self.lock = InstanceLock(lock_path(self.config), logger=self.logger)
+        try:
+            self.lock.acquire(extra={
+                'symbol': self.config['BROKER']['symbol'],
+                'magic': self.config['BROKER']['magic_number'],
+                'paper_mode': self.paper_mode,
+            })
+        except AlreadyRunning as e:
+            self.logger.error("#" * 64)
+            self.logger.error(f"REFUSING TO START: another instance is ALREADY RUNNING "
+                              f"(PID {e.pid}) and holds {Path(e.path).name}.")
+            self.logger.error("Two bots on the same symbol would double-trade it. "
+                              "Stop the other instance first (/stop), or kill that PID.")
+            self.logger.error("#" * 64)
+            raise SystemExit(3)
+
         # Initialize MT5
         if not self.initialize_mt5():
             raise Exception("Failed to initialize MT5")
@@ -353,9 +374,9 @@ class FusionSniperBot:
             except Exception:
                 pass
 
-        # Write status file for remote control
-        self.write_status_file()
-    
+        # Write status file for remote control (first write stamps started_at)
+        self.write_status_file(first=True)
+
     def _resolve_paper_mode(self, cli_paper):
         """Decide PAPER vs LIVE and record which source asked for it.
 
@@ -484,20 +505,32 @@ class FusionSniperBot:
         self.log_file_handler = file_handler
 
     
-    def write_status_file(self):
-        """Write bot status file with PID for remote control"""
+    def write_status_file(self, first=False):
+        """Write bot_status.json with a HEARTBEAT, atomically.
+
+        Called every loop iteration. A PID alone cannot distinguish a working bot from one
+        wedged on a dead socket -- and PIDs get recycled, so a dead bot's PID can be held by
+        an unrelated process and look alive forever. The heartbeat is what makes 'hung'
+        detectable: PID alive + heartbeat stale => hung, alert and restart.
+
+        Atomic (temp + os.replace) because the watchdog reads this file on its own schedule
+        and must never catch a half-written one and conclude the bot is dead.
+        """
         try:
-            status_file = Path('logs') / 'bot_status.json'
-            status_data = {
+            if first or not getattr(self, '_started_at', None):
+                self._started_at = datetime.now().isoformat()
+            write_json_atomic(Path('logs') / 'bot_status.json', {
                 'pid': os.getpid(),
-                'started_at': datetime.now().isoformat(),
+                'started_at': self._started_at,
+                'heartbeat': datetime.now().isoformat(),
                 'symbol': self.symbol,
-                'magic_number': self.magic_number
-            }
-            with open(status_file, 'w') as f:
-                json.dump(status_data, f, indent=2)
-            self.logger.info(f"Status file created: PID {os.getpid()}")
+                'magic_number': self.magic_number,
+                'paper_mode': bool(self.paper_mode),
+            })
+            if first:
+                self.logger.info(f"Status file created: PID {os.getpid()} (heartbeat active)")
         except Exception as e:
+            # Never let a status-write failure kill the trading loop.
             self.logger.error(f"Error writing status file: {e}")
     
     def remove_status_file(self):
@@ -2361,6 +2394,13 @@ class FusionSniperBot:
                 # v5.0.0 (C3): every iteration is wrapped so a transient error logs and
                 # CONTINUES instead of killing the bot. A run of errors backs off and alerts.
                 try:
+                    # HEARTBEAT. Written EVERY iteration, before any work that could block,
+                    # so the watchdog can tell a working bot from a hung one. This is the
+                    # first thing in the loop deliberately: if we only refreshed it after
+                    # the market/gate checks, a bot wedged inside one of them would look
+                    # dead rather than hung.
+                    self.write_status_file()
+
                     # v5.0.0 (M11): a manual stop flag means a graceful, clean shutdown.
                     if self._manual_stop_requested():
                         self.logger.info("Manual stop flag detected - shutting down gracefully")
@@ -2582,6 +2622,16 @@ class FusionSniperBot:
         self.remove_status_file()
 
         mt5.shutdown()
+
+        # Release the single-instance lock LAST, and only if it is still ours. A lock left
+        # behind is not fatal (the next start sees a dead PID and replaces it), but leaving
+        # it is untidy and delays a legitimate restart by one liveness check.
+        try:
+            if getattr(self, 'lock', None):
+                self.lock.release()
+        except Exception as e:
+            self.logger.error(f"Error releasing instance lock: {e}")
+
         self.logger.info("Bot shut down complete")
 
         self.telegram.notify_shutdown(self.symbol)

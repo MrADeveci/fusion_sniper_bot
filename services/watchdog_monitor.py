@@ -11,6 +11,11 @@ import json
 from datetime import datetime, timedelta
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from modules.liveness import (check_liveness, lock_path, redact_token,   # noqa: E402
+                              STOPPED, ALIVE, HUNG)
+from modules.telegram_notifier import TelegramNotifier                   # noqa: E402
+
 class WatchdogMonitor:
     """Monitor and restart bot if it crashes"""
     
@@ -92,32 +97,47 @@ class WatchdogMonitor:
         
         return True
     
+    def bot_liveness(self):
+        """(state, info): STOPPED | ALIVE | HUNG.
+
+        The old check ran `tasklist /FI "PID eq {pid}"` through a shell and substring-
+        matched the output, so ANY process that inherited the dead bot's recycled PID made
+        it look alive -- and the watchdog would then never restart a bot that had died.
+        It also could not see a bot that was alive but wedged. Now: PID exists AND the
+        image is python.exe AND the heartbeat is fresh. A live LOCK also counts as running.
+        """
+        return check_liveness(self.config, self.bot_status_file,
+                              lock_path(self.config, self.log_dir))
+
     def is_bot_running(self):
-        """Check if bot is running by checking status file"""
-        if not self.bot_status_file.exists():
-            return False
-        
+        """Backwards-compatible boolean: hung still counts as RUNNING (do not double-start)."""
+        state, _ = self.bot_liveness()
+        return state != STOPPED
+
+    def alert(self, text):
+        """Fire a Telegram alert. Never let a notification failure kill the watchdog."""
         try:
-            with open(self.bot_status_file, 'r') as f:
-                status = json.load(f)
-            
-            pid = status.get('pid')
-            if not pid:
-                return False
-            
-            # Check if process exists (Windows)
-            check_command = f'tasklist /FI "PID eq {pid}" /NH'
-            result = subprocess.run(
-                check_command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=5
-            )
-            
-            return str(pid) in result.stdout
+            tg = self.config.get('TELEGRAM', {})
+            if not tg.get('enabled', False) or not tg.get('bot_token'):
+                return
+            notifier = TelegramNotifier(tg['bot_token'], tg['chat_id'], enabled=True)
+            notifier.send_message(text)
         except Exception as e:
-            print(f"Error checking bot status: {e}")
+            print(f"Could not send Telegram alert: {redact_token(e, self.config.get('TELEGRAM', {}).get('bot_token'))}")
+
+    def kill_bot(self, pid):
+        """Kill a hung bot. List form, no shell, PID forced to int."""
+        try:
+            pid = int(pid)
+        except (TypeError, ValueError):
+            return False
+        try:
+            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                           capture_output=True, text=True, timeout=10, shell=False)
+            print(f"Killed hung bot PID {pid}")
+            return True
+        except Exception as e:
+            print(f"Failed to kill PID {pid}: {e}")
             return False
     
     def is_bot_recently_started(self):
@@ -243,9 +263,33 @@ class WatchdogMonitor:
                     time.sleep(10)
                     continue
 
-                # Check if bot is running
-                bot_running = self.is_bot_running()
+                # Check if bot is running (identity-verified + heartbeat)
+                state, info = self.bot_liveness()
+                bot_running = state != STOPPED
                 bot_recently_started = self.is_bot_recently_started()
+
+                # HUNG: the process is alive but its heartbeat has gone stale. This is the
+                # case the old PID-only check could never see -- the bot sat there wedged
+                # and the watchdog reported it healthy forever. Alert, kill, then let the
+                # normal restart path bring it back.
+                if state == HUNG and not bot_recently_started:
+                    age = info.get('heartbeat_age')
+                    age_txt = f"{age:.0f}s" if age is not None else "never written"
+                    ts = datetime.now().strftime('%d/%m/%Y %I:%M:%S %p')
+                    print(f"[{ts}] BOT HUNG: PID {info.get('pid')} alive but heartbeat "
+                          f"{age_txt} old (max {info.get('max_age')}s). Killing and restarting.")
+                    self.alert(
+                        f"⚠️ <b>BOT HUNG</b> — {self.config['BROKER']['symbol']}\n\n"
+                        f"PID {info.get('pid')} is alive but its heartbeat is <b>{age_txt}</b> old "
+                        f"(max {info.get('max_age')}s).\n"
+                        f"The process is wedged, not working. Killing it and restarting.\n\n"
+                        f"⏰ {ts}")
+                    self.kill_bot(info.get('pid'))
+                    time.sleep(3)                 # let the OS reap it and the lock go stale
+                    if self.start_bot():
+                        print(f"[{ts}] Restarted after hang")
+                    time.sleep(self.check_interval)
+                    continue
 
                 if not bot_running:
                     # Don't restart if bot just started (another instance may be launching)
