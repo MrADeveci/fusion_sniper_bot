@@ -3,17 +3,32 @@
   Registers the At-Logon startup chain that brings the trading stack back after a reboot.
 
 .DESCRIPTION
-  Creates three scheduled tasks, all triggered "At log on" of the CURRENT user:
+  Creates TWO scheduled tasks, both triggered "At log on" of the CURRENT user:
 
     1. FusionSniper-MT5        +60s   the portable MT5 terminal (network needs a moment)
-    2. FusionSniper-Watchdog   +90s   watchdog_monitor.py  -- this is what starts the BOT
-    3. FusionSniper-Telegram   +90s   telegram_command_handler.py
+    2. FusionSniper-Watchdog   +90s   watchdog_monitor.py, via pythonw.exe
 
-  There is deliberately NO task for main_bot.py. The watchdog owns the bot's lifecycle:
-  its cold-start logic brings the bot up, and bot_state.json restores position state. A
-  second starter would race the watchdog to launch a bot. (The instance lock added in
-  "safety: instance lock, heartbeat liveness, offset persistence" means the loser now
-  exits cleanly instead of double-trading -- but racing at all is still wrong.)
+  That is the whole startup chain. There is no task for the bot and none for the Telegram
+  handler: the WATCHDOG starts both, so it can also restart both. Anything with its own
+  task is a process nothing supervises -- which is exactly how the handler stayed dead on
+  13/07 while the watchdog that could have revived it had never been asked to.
+
+  WHY pythonw.exe, NOT python.exe
+  -------------------------------
+  python.exe gets a console. On this machine HKCU:\Console\%%Startup DelegationTerminal is
+  the all-zero GUID ("let Windows decide"), which on Win11 hands every new console to
+  Windows Terminal -- INCLUDING one started by Task Scheduler. So a python.exe watchdog is
+  not an independent process at all: it is a tab in a shared window, and it dies when that
+  window does. On 13/07 the watchdog, the handler, the bot and an editor session were all
+  consoles of the same WindowsTerminal.exe. It went away at 06:38 and took all four; the
+  stack stayed down because the one thing that could have restarted it was inside the thing
+  that died. MT5 survived only because it is a GUI app with no terminal host.
+
+  pythonw.exe has NO console, therefore no terminal host, therefore no window that can be
+  closed. It logs to logs\watchdog.log instead. The bot and handler may still live in `wt`
+  tabs -- they are allowed to be fragile, because the watchdog outlives them and rebuilds
+  them within one check interval. The watchdog's own death is covered by the dead-man
+  switch (BetterStack), the only monitor that is not on this machine.
 
   Each task restarts on failure (3 attempts, 1 min apart) and is allowed to run on battery.
 
@@ -39,12 +54,15 @@ $cfg = Get-Content $cfgPath -Raw | ConvertFrom-Json
 $mt5 = $cfg.BROKER.mt5_path
 $portable = $cfg.BROKER.portable
 $python = (Get-Command python).Source
+$pythonw = Join-Path (Split-Path $python -Parent) 'pythonw.exe'
 $user = "$env:USERDOMAIN\$env:USERNAME"
 
 if (-not (Test-Path $mt5)) { throw "MT5 terminal not found at $mt5 (BROKER.mt5_path)" }
+if (-not (Test-Path $pythonw)) { throw "pythonw.exe not found next to $python -- the watchdog needs a console-less interpreter" }
 
 Write-Host "Bot dir  : $BotDir"
 Write-Host "Python   : $python"
+Write-Host "Pythonw  : $pythonw  (watchdog: no console => no terminal host)"
 Write-Host "MT5      : $mt5  (portable=$portable)"
 Write-Host "Run as   : $user"
 Write-Host ""
@@ -92,15 +110,26 @@ Register-One -Name 'FusionSniper-MT5' -Exe $mt5 -Arguments $mt5Args `
   -WorkDir (Split-Path $mt5 -Parent) -DelaySpec 'PT60S' `
   -Description 'Fusion Sniper: portable MT5 terminal (60s post-logon delay for network)'
 
-# 2. Watchdog. THIS is what starts the bot -- see the note above about no main_bot task.
-Register-One -Name 'FusionSniper-Watchdog' -Exe $python `
+# 2. The watchdog -- the ONLY supervisor, and the only other task.
+#
+# pythonw.exe, so it has no console and therefore cannot be hosted by (and killed with)
+# Windows Terminal. See the header. It starts and supervises BOTH the bot and the Telegram
+# handler, as tabs in a shared terminal window that it is free to rebuild whenever it dies.
+Register-One -Name 'FusionSniper-Watchdog' -Exe $pythonw `
   -Arguments "services\watchdog_monitor.py $ConfigFile" -WorkDir $BotDir -DelaySpec 'PT90S' `
-  -Description 'Fusion Sniper: watchdog (owns bot lifecycle + dead-man switch)'
+  -Description 'Fusion Sniper: watchdog (detached, no console; owns bot + handler lifecycles)'
 
-# 3. Telegram command handler.
-Register-One -Name 'FusionSniper-Telegram' -Exe $python `
-  -Arguments "services\telegram_command_handler.py $ConfigFile" -WorkDir $BotDir -DelaySpec 'PT90S' `
-  -Description 'Fusion Sniper: Telegram command handler'
+# Tasks from earlier designs must go. FusionSniper-Telegram in particular: the watchdog now
+# starts the handler, so leaving its task registered would start a SECOND, unsupervised one.
+# FusionSniper-Stack was a wt-based launcher that this supersedes and that never shipped.
+foreach ($old in 'FusionSniper-Telegram', 'FusionSniper-Stack') {
+  if (Get-ScheduledTask -TaskName $old -ErrorAction SilentlyContinue) {
+    if ($PSCmdlet.ShouldProcess($old, "Unregister superseded task")) {
+      Unregister-ScheduledTask -TaskName $old -Confirm:$false
+      Write-Host "  removed superseded task: $old"
+    }
+  }
+}
 
 Write-Host ""
 Write-Host "Done. Verify with:  scripts\ops\verify_recovery.ps1"
