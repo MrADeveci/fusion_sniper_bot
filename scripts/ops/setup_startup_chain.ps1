@@ -62,9 +62,15 @@ function New-Settings {
 }
 
 function Register-One {
-  param($Name, $Exe, $Args, $WorkDir, $DelaySpec, $Description)
+  # NOTE: do NOT name a parameter $Args -- it is a PowerShell automatic variable and the
+  # binder refuses to bind a string to it.
+  param($Name, $Exe, $Arguments, $WorkDir, $DelaySpec, $Description)
 
-  $action = New-ScheduledTaskAction -Execute $Exe -Argument $Args -WorkingDirectory $WorkDir
+  if ([string]::IsNullOrEmpty($Arguments)) {
+    $action = New-ScheduledTaskAction -Execute $Exe -WorkingDirectory $WorkDir
+  } else {
+    $action = New-ScheduledTaskAction -Execute $Exe -Argument $Arguments -WorkingDirectory $WorkDir
+  }
   $trigger = New-ScheduledTaskTrigger -AtLogOn -User $user
   $trigger.Delay = $DelaySpec           # ISO 8601, e.g. PT60S
 
@@ -75,25 +81,25 @@ function Register-One {
       -RunLevel Limited -Description $Description | Out-Null
     Write-Host "  registered: $Name  (delay $DelaySpec)"
   } else {
-    Write-Host "  WHATIF  $Name : $Exe $Args   (delay $DelaySpec)"
+    Write-Host "  WHATIF  $Name : $Exe $Arguments   (delay $DelaySpec)"
   }
 }
 
 # 1. MT5 terminal. /portable matches BROKER.portable=true, so it uses ITS OWN config
 #    directory next to the exe -- which is where the saved broker credentials live.
 $mt5Args = if ($portable) { '/portable' } else { '' }
-Register-One -Name 'FusionSniper-MT5' -Exe $mt5 -Args $mt5Args `
+Register-One -Name 'FusionSniper-MT5' -Exe $mt5 -Arguments $mt5Args `
   -WorkDir (Split-Path $mt5 -Parent) -DelaySpec 'PT60S' `
   -Description 'Fusion Sniper: portable MT5 terminal (60s post-logon delay for network)'
 
 # 2. Watchdog. THIS is what starts the bot -- see the note above about no main_bot task.
 Register-One -Name 'FusionSniper-Watchdog' -Exe $python `
-  -Args "services\watchdog_monitor.py $ConfigFile" -WorkDir $BotDir -DelaySpec 'PT90S' `
+  -Arguments "services\watchdog_monitor.py $ConfigFile" -WorkDir $BotDir -DelaySpec 'PT90S' `
   -Description 'Fusion Sniper: watchdog (owns bot lifecycle + dead-man switch)'
 
 # 3. Telegram command handler.
 Register-One -Name 'FusionSniper-Telegram' -Exe $python `
-  -Args "services\telegram_command_handler.py $ConfigFile" -WorkDir $BotDir -DelaySpec 'PT90S' `
+  -Arguments "services\telegram_command_handler.py $ConfigFile" -WorkDir $BotDir -DelaySpec 'PT90S' `
   -Description 'Fusion Sniper: Telegram command handler'
 
 Write-Host ""
