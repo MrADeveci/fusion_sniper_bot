@@ -223,6 +223,11 @@ class FusionSniperBot:
         # VOLATILITY DETECTION
         self.volatility_config = self.config['TRADING'].get('volatility_detection', {})
         self.volatility_enabled = self.volatility_config.get('enabled', False)
+        # Does the ACTIVE engine actually act on the scalp/normal volatility mode? Only SMC
+        # does (scalp quick-profit exit + scalp cooldown). Under momentum the mode changes
+        # nothing, so we neither classify nor announce it. The ATR itself is still computed:
+        # the extreme-ATR entry gate needs it on every engine.
+        self.engine_uses_volatility_mode = (self.engine != 'momentum')
         self.atr_period = self.volatility_config.get('atr_period', 14)
         self.atr_scalp_threshold = self.volatility_config.get('atr_scalp_threshold', 2.0)
         self.scalp_profit_target = self.volatility_config.get('scalp_profit_target_gbp', 26.82)
@@ -357,12 +362,19 @@ class FusionSniperBot:
             if self.daily_profit_target > 0:
                 self.logger.info(f"Daily Profit Target: £{self.daily_profit_target} (PAUSE mode)")
 
-            if self.volatility_enabled:
+            if self.volatility_enabled and self.engine_uses_volatility_mode:
                 self.logger.info("="*50)
                 self.logger.info("AUTO-VOLATILITY DETECTION ENABLED")
                 self.logger.info(f"Scalp threshold: ATR > {self.atr_scalp_threshold}")
                 self.logger.info(f"Scalp target: £{self.scalp_profit_target}")
                 self.logger.info("="*50)
+            elif self.volatility_enabled:
+                # Say what IS true: the ATR is used for the extreme-volatility entry skip,
+                # but the scalp mode this config block also describes is inert on this engine.
+                self.logger.info(
+                    f"Volatility: ATR used for the extreme-ATR entry skip only "
+                    f"(> {self.atr_max_for_trading}). Scalp mode does not apply to the "
+                    f"{self.engine} engine.")
 
         self.logger.info("News Filter: ENABLED (ForexFactory XML format)")
         self.logger.info("News Fetch: Continuous (even when paused)")
@@ -1126,20 +1138,33 @@ class FusionSniperBot:
             return None
 
     def update_trading_mode(self):
-        """Update trading mode based on ATR"""
+        """Refresh current_atr and, where the engine actually uses it, the volatility mode."""
         if not self.volatility_enabled:
             return
-        
+
         try:
             atr = self.calculate_atr()
             if atr is None:
                 return
-            
+
+            # current_atr is ALWAYS needed -- the extreme-ATR entry gate reads it -- so it is
+            # refreshed regardless of engine.
             self.current_atr = atr
+
+            # The scalp/normal volatility MODE is an SMC-engine concept: it exists to drive
+            # the scalp quick-profit exit and the scalp cooldown. The momentum engine has
+            # neither (manage_positions returns before check_quick_profit_exit; it exits on
+            # the ATR trail alone), so the mode is INERT. Logging "SWITCHED TO SCALPING MODE"
+            # there announced behaviour that never happens -- the log should only report
+            # things that are actually happening.
+            if not self.engine_uses_volatility_mode:
+                self.last_atr_check = datetime.now()
+                return
+
             previous_mode = self.current_mode
-            
+
             self.current_mode = 'scalp' if atr > self.atr_scalp_threshold else 'normal'
-            
+
             if previous_mode != self.current_mode:
                 if self.current_mode == 'scalp':
                     self.logger.info("="*50)
@@ -2492,8 +2517,10 @@ class FusionSniperBot:
                                 "Skipping new trades due to extreme volatility"
                             )
 
-                    # v5.0.0 (M8): only log the mode line when it CHANGES
-                    if self.volatility_enabled and self.current_atr:
+                    # v5.0.0 (M8): only log the mode line when it CHANGES -- and only on an
+                    # engine that acts on the mode at all (see engine_uses_volatility_mode).
+                    if (self.volatility_enabled and self.current_atr
+                            and self.engine_uses_volatility_mode):
                         if self.current_mode != self._last_logged_mode:
                             mode_label = "[SCALP]" if self.current_mode == 'scalp' else "[NORMAL]"
                             self.logger.info(
