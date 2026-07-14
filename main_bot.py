@@ -28,7 +28,7 @@ from modules.trade_statistics import TradeStatistics
 from modules.atomic_json import write_json_atomic, read_json_quarantine
 from modules.broker_costs import swap_cost, commission_cost
 from modules.instance_lock import InstanceLock, AlreadyRunning
-from modules.liveness import lock_path
+from modules.liveness import lock_path, last_seen_path
 
 PAPER_TICKET_BASE = 90000000     # simulated tickets start above any real broker ticket
 
@@ -546,12 +546,39 @@ class FusionSniperBot:
             self.logger.error(f"Error writing status file: {e}")
     
     def remove_status_file(self):
-        """Remove status file on shutdown"""
+        """Record the last heartbeat, THEN remove the status file, on shutdown.
+
+        Removing bot_status.json also destroys the only record of when the bot was last
+        alive, so after a graceful reboot the watchdog's recovery alert could not say how
+        long the stack had been down. Persist the final heartbeat to bot_last_seen.json
+        first; the watchdog falls back to it when the status file is gone.
+        """
         try:
             status_file = Path('logs') / 'bot_status.json'
+            status = {}
+            if status_file.exists():
+                try:
+                    with open(status_file, 'r', encoding='utf-8') as f:
+                        status = json.load(f) or {}
+                except Exception:
+                    status = {}
+
+            write_json_atomic(last_seen_path('logs'), {
+                'pid': os.getpid(),
+                # The heartbeat we actually last wrote. Fall back to now() only if the
+                # status file was unreadable -- now() is a close upper bound either way,
+                # since shutdown follows the final loop iteration.
+                'heartbeat': status.get('heartbeat') or datetime.now().isoformat(),
+                'stopped_at': datetime.now().isoformat(),
+                'reason': 'clean shutdown',
+                'symbol': self.symbol,
+                'magic_number': self.magic_number,
+                'paper_mode': bool(self.paper_mode),
+            })
+
             if status_file.exists():
                 status_file.unlink()
-                self.logger.info("Status file removed")
+                self.logger.info("Status file removed (last heartbeat saved to bot_last_seen.json)")
         except Exception as e:
             self.logger.error(f"Error removing status file: {e}")
     

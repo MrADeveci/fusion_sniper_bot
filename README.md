@@ -159,7 +159,8 @@ fusion_sniper_bot/
     REBOOT_RECOVERY.md     # unattended restart: auto-logon -> tasks -> watchdog -> bot
     experiments/           # backtest evidence for why this bot is not live yet
 
-  logs/                    # gitignored: logs, bot_status.json, bot_state.json
+  logs/                    # gitignored: logs, bot_status.json, bot_state.json,
+                           #             bot_last_seen.json (last heartbeat before a clean stop)
   cache/                   # gitignored: news cache
   data/                    # gitignored: exported bars
 ```

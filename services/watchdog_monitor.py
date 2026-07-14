@@ -40,8 +40,20 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from modules.liveness import (check_liveness, lock_path, redact_token,   # noqa: E402
-                              STOPPED, ALIVE, HUNG)
+                              read_last_seen, STOPPED, ALIVE, HUNG)
 from modules.telegram_notifier import TelegramNotifier                   # noqa: E402
+
+def _fmt_duration(seconds):
+    """Seconds -> '45s' / '12m' / '3h 07m' / '2d 4h'. A downtime you read on a phone."""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    if s < 86400:
+        return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+    return f"{s // 86400}d {(s % 86400) // 3600}h"
+
 
 HANDLER_SCRIPT = 'services\\telegram_command_handler.py'
 HANDLER_MARKER = 'telegram_command_handler'   # how we recognise it in a command line
@@ -259,10 +271,24 @@ class WatchdogMonitor:
                     else "stopped (watchdog will start it)"
 
         age = info.get('heartbeat_age')
-        if age is None:
-            age_txt = "none found (no prior heartbeat)"
-        else:
+        if age is not None:
             age_txt = f"{age:.0f}s ago"
+        else:
+            # No live heartbeat. A CLEAN shutdown deletes bot_status.json, so the only
+            # record of when the bot was last alive is the tombstone it leaves behind --
+            # which is precisely the graceful-reboot case this alert exists to report.
+            last_age, rec = read_last_seen(self.log_dir)
+            if last_age is not None:
+                stopped = rec.get('stopped_at')
+                when = ""
+                try:
+                    when = f" at {datetime.fromisoformat(stopped):%d/%m %H:%M}"
+                except Exception:
+                    pass
+                age_txt = (f"{_fmt_duration(last_age)} ago "
+                           f"— {rec.get('reason', 'stopped')}{when}")
+            else:
+                age_txt = "none found (no prior heartbeat)"
 
         boot = ""
         try:

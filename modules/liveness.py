@@ -113,6 +113,34 @@ def lock_path(config, log_dir="logs") -> Path:
     return Path(log_dir) / f"bot_{b.get('symbol', 'UNKNOWN')}_{b.get('magic_number', 0)}.lock"
 
 
+def last_seen_path(log_dir="logs") -> Path:
+    return Path(log_dir) / "bot_last_seen.json"
+
+
+def read_last_seen(log_dir="logs", now=None):
+    """-> (age_seconds, record) for the bot's final heartbeat, or (None, None).
+
+    bot_status.json is DELETED on a clean shutdown, which is exactly the case where the
+    watchdog most wants to say how long the stack was down (a graceful reboot). This file
+    is the tombstone the bot leaves behind instead: written immediately before the status
+    file is removed, so it survives the shutdown that erases the heartbeat.
+
+    A crash or hard reset never gets here -- but that path leaves bot_status.json intact
+    with its last heartbeat, so between the two the downtime is always recoverable.
+    """
+    rec = _read_json(last_seen_path(log_dir))
+    if not rec:
+        return None, None
+    hb = rec.get("heartbeat")
+    if not hb:
+        return None, rec
+    try:
+        age = ((now or datetime.now()) - datetime.fromisoformat(hb)).total_seconds()
+    except Exception:
+        return None, rec
+    return age, rec
+
+
 def check_liveness(config, status_file, lock_file=None, now=None):
     """-> (state, info). state is STOPPED | ALIVE | HUNG.
 
