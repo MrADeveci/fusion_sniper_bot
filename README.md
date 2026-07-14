@@ -156,6 +156,8 @@ fusion_sniper_bot/
 
   docs/
     CODE_AUDIT.md          # v5.0 reliability/correctness audit
+    REBOOT_RECOVERY.md     # unattended restart: auto-logon -> tasks -> watchdog -> bot
+    experiments/           # backtest evidence for why this bot is not live yet
 
   logs/                    # gitignored: logs, bot_status.json, bot_state.json
   cache/                   # gitignored: news cache
